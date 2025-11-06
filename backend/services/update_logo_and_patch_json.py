@@ -6,12 +6,18 @@ Usage:
   .venv/bin/python services/update_logo_and_patch_json.py --file PATH/TO/YESBANK.png
 
 This:
- - copies the input image -> input_data/images/processed_images/processed_logos/<SYMBOL>_logo.<ext>
+ - copies the input image into the processed logos directory (defaults via env_utils.build_local_path)
  - updates company_logo in JSON files under data/announcements whose symbol matches.
 """
 from __future__ import annotations
 import argparse, sys, json, shutil, re
 from pathlib import Path
+
+from backend.services import env_utils
+
+DEFAULT_PROCESSED_LOGO_DIR = env_utils.build_local_path(
+    "backend/input_data/images/processed_images/processed_logos"
+)
 
 def derive_symbol_from_filename(name: str) -> str:
     stem = Path(name).stem
@@ -23,7 +29,11 @@ def derive_symbol_from_filename(name: str) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=True, help="Path to image file to install as logo")
-    ap.add_argument("--outdir", default="input_data/images/processed_images/processed_logos", help="Processed logos dir")
+    ap.add_argument(
+        "--outdir",
+        default=DEFAULT_PROCESSED_LOGO_DIR,
+        help="Processed logos dir (defaults to repo input_data processed logos)",
+    )
     args = ap.parse_args()
 
     img_path = Path(args.file)
@@ -32,7 +42,7 @@ def main():
         sys.exit(2)
 
     base = Path.cwd()
-    processed_dir = (base / args.outdir).resolve()
+    processed_dir = Path(args.outdir).expanduser().resolve()
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     symbol = derive_symbol_from_filename(img_path.name)

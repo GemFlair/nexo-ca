@@ -18,6 +18,9 @@ Features
 Author: Assistant (generated)
 Date: 29-Oct-2025
 """
+
+# Refactored: centralized .env loading via env_utils (no direct dotenv usage)
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +34,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Pattern, Protoc
 
 from pydantic import BaseModel, Field, root_validator, validator
 from pydantic_settings import SettingsConfigDict
+
+from backend.services import env_utils
 
 # -------------------------
 # Observability Protocols
@@ -140,7 +145,7 @@ class SentimentSettings(BaseModel):
       SENTIMENT_POS_THRESHOLD=0.66
       SENTIMENT_NEG_THRESHOLD=0.34
     """
-    model_config = SettingsConfigDict(env_prefix="SENTIMENT_", env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_prefix="SENTIMENT_")
 
     LLM_WEIGHT: float = Field(0.4, ge=0.0, le=1.0)
     KEYWORD_WEIGHT: float = Field(0.6, ge=0.0, le=1.0)

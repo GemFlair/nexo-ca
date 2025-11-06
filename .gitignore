@@ -1,21 +1,117 @@
-backend/input_data/pdf/
-backend/input_data/images/
-backend/input_data/csv/
-backend/data/
-backend/error_reports/
-backend/logs/
-*.DS_Store
-.venv/
-__pycache__/
-.env
-node_modules/
-.expo/
-.DS_Store
-android/
-ios/
-build/
-# Created by venv; see https://docs.python.org/3/library/venv.html
+# =========================================================
+# NEXO PROJECT - .gitignore
+# FastAPI + Python + Docker + AWS + VS Code
+# =========================================================
 
-# Combined ignores from frontend & backend venv
-*.pyc
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# -----------------------------
+# Environment & secrets
+# -----------------------------
+.env
+.env.prod
+.env.dev
+.env.disabled
+.env.*
+!.env.local_dev        # allow this safe local file
+
+# -----------------------------
+# Logs and runtime data
+# -----------------------------
 *.log
+logs/
+*.out
+*.err
+
+# -----------------------------
+# Test and coverage
+# -----------------------------
+.coverage
+htmlcov/
+pytest_cache/
+.tox/
+.cache/
+.pytest_cache/
+coverage.xml
+test-results/
+
+# -----------------------------
+# Build / packaging
+# -----------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# -----------------------------
+# Editors / IDEs
+# -----------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -----------------------------
+# macOS
+# -----------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# -----------------------------
+# Docker
+# -----------------------------
+*.pid
+docker-compose.override.yml
+*.env.local
+
+# -----------------------------
+# AWS / Cloud credentials
+# -----------------------------
+*.pem
+*.key
+*.crt
+
+# -----------------------------
+# Backend output / input data
+# -----------------------------
+backend/output_data/
+backend/input_data/
+*.csv
+*.json
+*.xlsx
+*.pdf
+
+# -----------------------------
+# Frontend (Framer / React / JS)
+# -----------------------------
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+
+# -----------------------------
+# Temporary / backup files
+# -----------------------------
+*.bak
+*.tmp
+*~
+*.lock
+
+# -----------------------------
+# Dependency managers
+# -----------------------------
+Pipfile.lock
+poetry.lock
+requirements copy.txt.bak

@@ -32,6 +32,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from backend.services import env_utils
+
+# Optional observability integration (Diamond standard)
+try:
+    from backend.services import observability_utils as obs  # type: ignore
+    _OBS_AVAILABLE = True
+except Exception:
+    obs = None  # type: ignore
+    _OBS_AVAILABLE = False
+
 # ---------- Settings ----------
 class Settings(BaseSettings):
     ENVIRONMENT: str = "dev"
@@ -63,17 +73,7 @@ class Settings(BaseSettings):
         if v.upper() not in valid_levels:
             raise ValueError(f'LOG_LEVEL must be one of {valid_levels}')
         return v.upper()
-# load root .env (idempotent) — ensures env vars are available regardless of CWD
-from pathlib import Path
-from dotenv import load_dotenv
-import os
-
-proj_root = Path(__file__).resolve().parents[1]  # two levels up: backend/ -> project root
-env_path = proj_root / ".env"
-if env_path.exists():
-    load_dotenv(dotenv_path=str(env_path))
-
-settings = Settings()
+settings = Settings(ENVIRONMENT=env_utils.get_environment())
 
 # ---------- Request Context ----------
 # Context var used to propagate request id into log records (async-safe)
@@ -120,6 +120,14 @@ class CorrelationFilter(logging.Filter):
 
 def setup_logging(log_level: str, environment: str) -> logging.Logger:
     """Configure logging with JSON for production."""
+    if _OBS_AVAILABLE and hasattr(obs, "get_logger"):
+        try:
+            logger = obs.get_logger("backend.main")  # type: ignore[attr-defined]
+            logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+            return logger
+        except Exception:
+            pass
+
     log_level_int = getattr(logging, log_level.upper(), logging.INFO)
     logger = logging.getLogger("backend.main")
 
@@ -147,22 +155,48 @@ def setup_logging(log_level: str, environment: str) -> logging.Logger:
 logger = setup_logging(settings.LOG_LEVEL, settings.ENVIRONMENT)
 logger.info("Settings loaded: ENVIRONMENT=%s", settings.ENVIRONMENT)
 
+
+def _metric_inc(name: str, value: int = 1) -> None:
+    try:
+        if _OBS_AVAILABLE and hasattr(obs, "metrics_inc"):
+            obs.metrics_inc(name, value)
+        else:
+            logger.debug("metric %s += %s (fallback)", name, value)
+    except Exception:
+        logger.debug("metric emit failed for %s", name, exc_info=True)
+
+
+def _audit(event: str, detail: dict, status: str = "success") -> None:
+    try:
+        if _OBS_AVAILABLE and hasattr(obs, "audit_log"):
+            obs.audit_log(event, "backend.main", status, detail)
+        else:
+            logger.info("AUDIT %s status=%s detail=%s", event, status, detail)
+    except Exception:
+        logger.debug("audit emit failed for %s", event, exc_info=True)
+
 # ---------- Warm index helper ----------
 async def _maybe_warm_index() -> None:
     """Run index warm-up in a threadpool if available and requested."""
     if not settings.WARM_INDEX_ON_STARTUP:
         logger.debug("WARM_INDEX_ON_STARTUP is false; skipping warm index")
         return
+    _metric_inc("app.index_warm.requests")
     try:
         from backend.services import index_builder
         loop = asyncio.get_running_loop()
         if hasattr(index_builder, "refresh_index"):
             logger.info("Running index_builder.refresh_index in executor")
             await loop.run_in_executor(None, getattr(index_builder, "refresh_index"))
+            _metric_inc("app.index_warm.success")
+            _audit("app.index_warm", {"status": "completed"})
         else:
             logger.info("index_builder has no refresh_index; skipping")
+            _metric_inc("app.index_warm.missing")
     except Exception as exc:
         logger.exception("Index warm-up failed (non-fatal)")
+        _metric_inc("app.index_warm.failure")
+        _audit("app.index_warm", {"error": str(exc)}, status="error")
 
 # ---------- Metrics collector setup ----------
 import threading
@@ -200,12 +234,21 @@ def setup_metrics():
             logger.debug("Metrics already setup; skipping")
             return
         try:
-            from backend.services.csv_processor import set_metrics_collector
-            set_metrics_collector(prometheus_collector)
-            _metrics_installed = True
-            logger.info("Metrics collector set up")
+            from backend.services import csv_processor  # type: ignore
+            hook = getattr(csv_processor, "set_metrics_collector", None)
+            if callable(hook):
+                hook(prometheus_collector)
+                _metrics_installed = True
+                logger.info("Metrics collector set up")
+                _metric_inc("app.metrics.setup.success")
+                _audit("app.metrics.setup", {"status": "success"})
+            else:
+                logger.debug("csv_processor.set_metrics_collector not available; skipping metrics hook")
+                _metric_inc("app.metrics.setup.missing")
         except Exception:
             logger.exception("Metrics setup failed (non-fatal)")
+            _metric_inc("app.metrics.setup.failure")
+            _audit("app.metrics.setup", {"status": "error"}, status="error")
 
 # ---------- Request ID Middleware ----------
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -252,20 +295,31 @@ async def lifespan(app: FastAPI):
         preload_settings()
         validate_settings(allow_local_default=settings.ENVIRONMENT.lower() != "prod")
         logger.info("CSV processor settings validated")
+        _metric_inc("app.csv_settings.validated")
+        _audit("app.csv_settings", {"status": "validated"})
     except Exception as exc:
         logger.exception("CSV processor validation failed: %s", exc)
+        _metric_inc("app.csv_settings.failure")
+        _audit("app.csv_settings", {"error": str(exc)}, status="error")
         raise  # Fail fast - don't start if CSV processing is broken
     
     logger.info("Application startup complete")
+    _metric_inc("app.startup.complete")
+    _audit("app.startup", {"status": "complete"})
     yield
     # Shutdown
     try:
         from backend.services.csv_processor import shutdown_csv_executors
         shutdown_csv_executors()
         logger.info("CSV processor executors shut down")
+        _metric_inc("app.csv_shutdown.success")
+        _audit("app.csv_shutdown", {"status": "success"})
     except Exception as exc:
         logger.exception("CSV processor shutdown failed: %s", exc)
+        _metric_inc("app.csv_shutdown.failure")
+        _audit("app.csv_shutdown", {"error": str(exc)}, status="error")
     logger.info("Application shutting down")
+    _metric_inc("app.shutdown.complete")
 
 # ---------- App creation ----------
 show_docs = settings.ENVIRONMENT.lower() != "prod"
@@ -338,7 +392,7 @@ if settings.ENABLE_RAW_ANNOUNCEMENTS and raw_announcements_router is not None:
     app.include_router(raw_announcements_router.router)
 
 # ---------- Static files ----------
-static_dir = Path("input_data")
+static_dir = Path(env_utils.build_local_path("backend/input_data"))
 if static_dir.exists() and static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     logger.info("Mounted /static -> %s", static_dir)

@@ -24,29 +24,33 @@ import pandas as pd
 
 # Try to pick up project's logger / metric / audit hooks (best-effort).
 try:
-    from backend.services.csv_processor import logger as _project_logger, _safe_metric as _safe_metric_fn, _audit_log as _audit_log_fn  # type: ignore
+    from backend.services import observability_utils as obs  # type: ignore
+
+    logger = obs.get_logger("backend.services.filename_utils")
+
+    def _safe_metric(op: str, value: int = 1) -> None:
+        try:
+            obs.metrics_inc(op, value)
+        except Exception:
+            logger.debug("metric emit failed for %s", op, exc_info=True)
+
+    def _audit_log(action: str, target: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            obs.audit_log(action, target, status, details or {})
+        except Exception:
+            logger.debug("audit emit failed for %s", action, exc_info=True)
 except Exception:
-    _project_logger = None
-    _safe_metric_fn = None
-    _audit_log_fn = None
+    import logging as _logging
 
-logger = _project_logger or logging.getLogger(__name__)
+    logger = _logging.getLogger(__name__)
+    if not logger.handlers:
+        logger.addHandler(_logging.NullHandler())
 
-def _safe_metric(op: str, value: int = 1) -> None:
-    try:
-        if _safe_metric_fn:
-            _safe_metric_fn(op, value)
-    except Exception:
-        logger.debug("filename_utils: metric emission failed for op=%s", op, exc_info=True)
+    def _safe_metric(op: str, value: int = 1) -> None:
+        logger.debug("metric %s += %s (fallback)", op, value)
 
-def _audit_log(action: str, target: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        if _audit_log_fn:
-            _audit_log_fn(action, target, status, details or {})
-        else:
-            logger.info("AUDIT %s %s -> %s : %s", action, target, status, details or {})
-    except Exception:
-        logger.debug("filename_utils: audit logging failed for action=%s target=%s", action, target, exc_info=True)
+    def _audit_log(action: str, target: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+        logger.info("AUDIT %s %s -> %s : %s", action, target, status, details or {})
 
 # -------------------------
 # Constants & regexes
@@ -57,7 +61,7 @@ TOKEN_MIN_LEN = 2
 PREFIX_MAX = 10
 MAX_FILENAME_LEN = 255
 
-_VALID_FILENAME_CHARS_RE = re.compile(r"^[a-zA-Z0-9\s._\-\&()]+$")
+_VALID_FILENAME_CHARS_RE = re.compile(r"^[a-zA-Z0-9\s._\-\&(),+'()]+$")
 
 _ABBREV_MAP = {
     r"\bltd\b": "limited",
@@ -87,20 +91,39 @@ class IndexBuilderProtocol(Protocol):
 # -------------------------
 # Module-level dependency resolution (deterministic & testable)
 # -------------------------
-index_builder = None
 try:
     from backend.services import index_builder as _ib  # type: ignore
-    index_builder = _ib
 except Exception:
+    _ib = None  # type: ignore
+
+index_builder = _ib
+
+
+def refresh_index_if_available(**kwargs) -> bool:
+    """
+    Optional helper to trigger index_builder.refresh_index() when present.
+    Returns True if a refresh hook was invoked successfully.
+    """
+    if index_builder is None:
+        logger.debug("refresh_index_if_available skipped: index_builder missing")
+        return False
+
+    hook = getattr(index_builder, "refresh_index", None)
+    if not callable(hook):
+        logger.debug("refresh_index_if_available skipped: refresh_index not exposed")
+        return False
+
     try:
-        from services import index_builder as _ib  # type: ignore
-        index_builder = _ib
-    except Exception:
-        try:
-            import index_builder as _ib  # type: ignore
-            index_builder = _ib
-        except Exception:
-            index_builder = None
+        hook(**kwargs)
+        _safe_metric("filename_utils.refresh_index.success")
+        safe_kwargs = {k: repr(v) for k, v in kwargs.items()}
+        _audit_log("filename_utils.refresh_index", "index_builder", "success", {"kwargs": safe_kwargs})
+        return True
+    except Exception as exc:
+        logger.exception("filename_utils: index_builder.refresh_index failed")
+        _safe_metric("filename_utils.refresh_index.failure")
+        _audit_log("filename_utils.refresh_index", "index_builder", "failure", {"error": str(exc)})
+        return False
 
 # -------------------------
 # Internal helpers
@@ -150,9 +173,9 @@ def strip_timestamp_and_ext(filename: str) -> str:
         if not filename:
             return ""
         name = os.path.basename(filename)
-        # remove extension
-        if "." in name:
-            name = ".".join(name.split(".")[:-1])
+        # remove extension (preserve hidden file stems like .env)
+        if "." in name and not name.startswith("."):
+            name = name.rsplit(".", 1)[0]
         # remove trailing timestamp like DD-MM-YYYY HH_MM_SS variants
         name = re.sub(r'[_ \-]*\d{2}[-/]\d{2}[-/]\d{4}[_ \-]+\d{2}[:_]\d{2}[:_]\d{2}$', "", name)
         # remove date-only trailing patterns e.g. _04-10-2025
@@ -208,6 +231,41 @@ def extract_datetime_from_filename(filename: str) -> Tuple[Optional[str], Option
     except Exception:
         logger.debug("extract_datetime_from_filename failed for %r", filename, exc_info=True)
         return None, None
+
+def extract_date_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract date-only value (YYYY-MM-DD) from filename.
+    Supports:
+      - 2025-10-04
+      - 04-10-2025
+      - 2025_10_04
+      - 04_10_2025
+    Returns normalized ISO format 'YYYY-MM-DD' or None.
+    """
+    try:
+        if not filename:
+            return None
+        name = os.path.basename(filename)
+        patterns = [
+            r"(\d{4}[-_]\d{2}[-_]\d{2})",   # 2025-10-04 or 2025_10_04
+            r"(\d{2}[-_]\d{2}[-_]\d{4})"    # 04-10-2025 or 04_10_2025
+        ]
+        for pat in patterns:
+            m = re.search(pat, name)
+            if m:
+                date_str = m.group(1).replace("_", "-")
+                try:
+                    # Check if it's YYYY-MM-DD format (year starts with 4 digits like 2025)
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                        return date_str
+                    # Otherwise parse as DD-MM-YYYY and convert
+                    return datetime.strptime(date_str, "%d-%m-%Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+        return None
+    except Exception:
+        logger.debug("extract_date_from_filename failed for %r", filename, exc_info=True)
+        return None
 
 def filename_tokens(name_only: str) -> List[str]:
     try:
@@ -596,6 +654,7 @@ __all__ = [
     "extract_datetime_from_filename",
     "filename_tokens",
     "filename_to_symbol",
+    "refresh_index_if_available",
     "health_check",
     "DEFAULT_JACCARD_THRESH",
     "DEFAULT_RATIO_THRESH",

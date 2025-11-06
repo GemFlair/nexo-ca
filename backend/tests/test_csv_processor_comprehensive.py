@@ -13,11 +13,11 @@ from unittest.mock import patch, MagicMock
 from moto import mock_aws
 
 # --- Setup sys.path to find the backend module ---
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from services import csv_processor
+from backend.services import csv_processor
 
 # --- Test Constants ---
 TEST_BUCKET = "test-csv-bucket"

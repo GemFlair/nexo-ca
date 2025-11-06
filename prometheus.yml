@@ -1,0 +1,16 @@
+# Basic Prometheus configuration for scraping the NEXO FastAPI backend.
+#
+# Usage:
+#   prometheus --config.file=prometheus.yml
+# or copy this scrape job into your existing Prometheus configuration.
+#
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "nexo-backend"
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "127.0.0.1:8000"

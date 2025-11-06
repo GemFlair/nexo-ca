@@ -165,6 +165,9 @@ def test_download_prefix_to_local_handles_runtimeerror(monkeypatch):
 def test_upload_dir_to_s3_uploads_files(monkeypatch, tmp_path):
     fs_mock = MagicMock()
     fs_mock.open.return_value.__enter__.return_value = MagicMock()
+    # Mock fs.size() to return correct file size for integrity check
+    fs_mock.size.return_value = 4  # "data" is 4 bytes
+    fs_mock.exists.return_value = False  # File doesn't exist yet
     monkeypatch.setattr(a, "get_s3_fs", lambda *_a, **_kw: (fs_mock, threading.Semaphore(1)))
 
     # Create dummy file
@@ -174,6 +177,7 @@ def test_upload_dir_to_s3_uploads_files(monkeypatch, tmp_path):
     ok = a.upload_dir_to_s3(tmp_path, "s3://bucket/prefix")
     assert ok is True
     fs_mock.open.assert_called()
+    fs_mock.size.assert_called()  # Verify integrity check was performed
 
 
 def test_upload_dir_to_s3_handles_no_dir(monkeypatch):

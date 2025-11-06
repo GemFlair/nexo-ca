@@ -1,0 +1,721 @@
+# backend/tests/test_pdf_processor.py
+"""
+DIAMOND-GRADE TEST SUITE — MasterPDFProcessor (GROK v9.9.9 Infinite)
+═══════════════════════════════════════════════════════════════════════════════════
+Coverage goals:
+ - Functional flows (happy / error)
+ - Resilience & fallback behaviour (S3 fallbacks, LLM timeout)
+ - Resource safety (instance/global executor shutdown)
+ - Concurrency semantics (image extraction + LLM overlap)
+ - Utilities: atomic write, sha1, settings validation
+ - Startup & runtime validation (native binaries, import resilience)
+ - Test isolation: no monkeypatch leakage, clean tmp dirs
+Run with: pytest -v --disable-warnings
+"""
+from __future__ import annotations
+
+import asyncio
+import gc
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import weakref
+from copy import deepcopy
+from dataclasses import asdict
+from importlib import reload
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple, Union
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+
+# Import module under test
+import backend.services.pdf_processor as pdf_proc
+from backend.services.pdf_processor import (
+    MasterPDFProcessor,
+    PDFProcessorSettings,
+    _atomic_write_json,
+    _compute_sha1,
+)
+
+# --- Defensive executor helpers (module may or may not expose these helpers) ---
+def _get_global_executor():
+    """Return module global executor, creating if necessary, with fallbacks."""
+    if hasattr(pdf_proc, "_get_global_executor"):
+        try:
+            return pdf_proc._get_global_executor()
+        except Exception:
+            pass
+    # fallback to _get_executor or _EXECUTOR pattern
+    if hasattr(pdf_proc, "_get_executor"):
+        return pdf_proc._get_executor()
+    # ensure an executor exists by calling internal _get_executor name variants
+    if hasattr(pdf_proc, "_get_executor_global"):
+        return pdf_proc._get_executor_global()
+    # last-resort: create one on the module
+    import concurrent.futures
+    ex = getattr(pdf_proc, "_EXECUTOR", None)
+    if ex is None:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=getattr(pdf_proc, "_SETTINGS").THREADPOOL_MAX_WORKERS)
+        setattr(pdf_proc, "_EXECUTOR", ex)
+    return ex
+
+def shutdown_global_executor(wait: bool = True):
+    """Shutdown module global executor, best-effort across module variants."""
+    if hasattr(pdf_proc, "shutdown_global_executor"):
+        try:
+            return pdf_proc.shutdown_global_executor(wait=wait)
+        except Exception:
+            pass
+    ex = getattr(pdf_proc, "_EXECUTOR", None)
+    try:
+        if ex is not None:
+            ex.shutdown(wait=wait)
+            # clear reference
+            pdf_proc._EXECUTOR = None
+    except Exception:
+        # some executors may not implement shutdown cleanly in test env
+        pass
+
+# -----------------------
+# FIXTURES: Test Isolation
+# -----------------------
+@pytest.fixture(autouse=True)
+def isolate_fs_and_proc(tmp_path, monkeypatch):
+    """
+    Creates isolated directories, and a fresh MasterPDFProcessor instance for each test.
+    Ensures tests never touch repo dirs.
+    """
+    # Change cwd to tmp to avoid accidental writes to repo paths
+    monkeypatch.chdir(tmp_path)
+
+    # Create processor instance and override its directories to tmp paths
+    proc = MasterPDFProcessor()
+    out = tmp_path / "out"
+    pdfs = tmp_path / "processed_pdfs"
+    errs = tmp_path / "errors"
+
+    proc.output_dir = out
+    proc.processed_pdf_dir = pdfs
+    proc.error_dir = errs
+
+    # Ensure clean state
+    for path in (out, pdfs, errs):
+        shutil.rmtree(str(path), ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+
+    ctx = {"tmp": tmp_path, "proc": proc, "out": out, "pdfs": pdfs, "errs": errs}
+    yield ctx
+
+    # Teardown: ensure background workers stopped and executor cleaned if present
+    try:
+        # best-effort cleanup
+        if hasattr(proc, "_executor") and proc._executor:
+            try:
+                proc._executor.shutdown(wait=False)
+            except Exception:
+                pass
+        # module-level executor cleanup
+        shutdown_global_executor(wait=False)
+        # also attempt instance close if present
+        if hasattr(proc, "close"):
+            try:
+                proc.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Final cleanup
+    for path in (out, pdfs, errs):
+        shutil.rmtree(str(path), ignore_errors=True)
+
+
+@pytest.fixture
+def mock_services():
+    """
+    Provide comprehensive mocks for external backend.services.* dependencies.
+    Use patch.dict in tests that need to inject them to ensure no leakage.
+    """
+    # llm mocks (async)
+    mock_llm = SimpleNamespace()
+    mock_llm.async_classify_headline_and_summary = AsyncMock(
+        return_value=("ACME Q3 Results Beat Estimates", "ACME reported strong Q3 earnings...", {"model": "test", "tokens": 100})
+    )
+    mock_llm.async_classify_sentiment = AsyncMock(return_value={"label": "Positive", "score": 0.9})
+    mock_llm.classify_headline_and_summary = Mock(return_value={"headline_final": "HF", "summary_60": "S", "llm_meta": {}})
+
+    # sentiment utils
+    mock_sentiment = MagicMock()
+    mock_sentiment.compute_sentiment.return_value = {"label": "Positive", "score": 0.85, "emoji": "📈"}
+    mock_sentiment.get_default_classifier = Mock(return_value=mock_sentiment)
+
+    # aws_utils
+    mock_aws = MagicMock()
+    mock_aws.upload_file_to_s3.return_value = True
+
+    # csv_utils
+    mock_csv = MagicMock()
+    mock_csv.get_market_snapshot.return_value = {
+        "symbol": "ACME",
+        "company_name": "ACME LTD",
+        "last_price": 123.45,
+    }
+    mock_csv.get_indices_for_symbol.return_value = ("Nifty 50", "Consumer")
+
+    # filename_utils
+    mock_filename = MagicMock()
+    mock_filename.filename_to_symbol.return_value = {
+        "found": True,
+        "symbol": "ACME",
+        "company_name": "ACME LTD",
+        "score": 1.0,
+        "match_type": "exact",
+    }
+
+    return {
+        "llm": mock_llm,
+        "sentiment": mock_sentiment,
+        "aws": mock_aws,
+        "csv": mock_csv,
+        "filename": mock_filename,
+    }
+
+
+@pytest.fixture
+def sample_pdf(tmp_path):
+    """Create a minimal dummy PDF file (content not parsed when extraction is patched)."""
+    pdf_path = tmp_path / "ACME_Q3_2025_Results.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%Dummy PDF for tests\n")
+    return pdf_path
+
+
+# -----------------------
+# HELPER: inject mocked services safely (module attribute injection)
+# -----------------------
+class ServicesContext:
+    """Context manager to inject mocked backend.services modules into the pdf_processor module."""
+
+    def __init__(self, mocks: Dict[str, Any]):
+        self.mocks = mocks
+        self._saved = {}
+
+    def __enter__(self):
+        # set attributes on the module directly (so the module-level variables are used)
+        for name, obj in self.mocks.items():
+            # save old if present
+            self._saved[name] = getattr(pdf_proc, name, None)
+            setattr(pdf_proc, name, obj)
+        # also mark services available if major pieces provided
+        pdf_proc._SERVICES_AVAILABLE = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for name, prev in self._saved.items():
+            setattr(pdf_proc, name, prev)
+        pdf_proc._SERVICES_AVAILABLE = False
+
+
+# -----------------------
+# ORIGINAL: TESTS: Core Functionality
+# -----------------------
+@pytest.mark.asyncio
+async def test_happy_path_creates_output(isolate_fs_and_proc, mock_services, sample_pdf):
+    """Successful processing should create JSON and move the PDF to processed folder."""
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+
+    # Inject services into module for code paths that call them
+    with ServicesContext({
+        "llm_utils": mock_services["llm"],
+        "sentiment_utils": mock_services["sentiment"],
+        "aws_utils": mock_services["aws"],
+        "csv_utils": mock_services["csv"],
+        "filename_utils": mock_services["filename"],
+    }):
+        # Patch heavy extraction to avoid actual PDF parsing libs
+        with patch("backend.services.pdf_processor._extract_text_multi", new=AsyncMock(return_value=(
+            "EXTRACTED: ACME Q3 Earnings Report...",
+            [{"page": 1, "text": "Sample text", "ocr": False}],
+            {"successful_method": "fitz"}
+        ))):
+            # Also patch image extraction to return a simple list
+            with patch("backend.services.pdf_processor._extract_images", new=AsyncMock(return_value=[{
+                "page": 1, "index": 0, "filename": "img.png", "local_path": "/tmp/img.png", "s3_path": None, "width": 100, "height": 50
+            }])):
+                result = await proc.process_pdf(sample_pdf)
+
+    assert result is not None, "Expected processing to succeed and return a result object"
+    # JSON persisted
+    json_files = list(isolate_fs_and_proc["out"].glob("**/*.json"))
+    assert len(json_files) == 1, f"Expected 1 JSON file, got {len(json_files)}"
+    # PDF moved to processed folder
+    moved_pdfs = list(isolate_fs_and_proc["pdfs"].glob("**/*.pdf"))
+    assert len(moved_pdfs) == 1, f"Expected PDF moved, found {len(moved_pdfs)}"
+
+
+@pytest.mark.asyncio
+async def test_result_contains_required_fields(isolate_fs_and_proc, mock_services, sample_pdf):
+    """Result object contains expected fields and structure."""
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+    with ServicesContext({
+        "llm_utils": mock_services["llm"],
+        "sentiment_utils": mock_services["sentiment"],
+        "csv_utils": mock_services["csv"],
+        "filename_utils": mock_services["filename"],
+    }):
+        with patch("backend.services.pdf_processor._extract_text_multi", new=AsyncMock(return_value=(
+            "Sample announcement text...",
+            [{"page": 1, "text": "Page content", "ocr": False}],
+            {"successful_method": "pypdf"}
+        ))):
+            res = await proc.process_pdf(sample_pdf)
+
+    assert res is not None
+    # res is MasterResult dataclass instance — convert to dict if needed
+    res_dict = asdict(res) if hasattr(res, "__dataclass_fields__") else (res.to_dict() if hasattr(res, "to_dict") else dict(res))
+    for key in ("id", "source_file", "metadata", "full_text", "pages"):
+        assert key in res_dict, f"Missing required field: {key}"
+
+
+# -----------------------
+# ORIGINAL: TESTS: Error Handling & Resilience
+# -----------------------
+@pytest.mark.asyncio
+async def test_missing_file_handled_gracefully(isolate_fs_and_proc):
+    """Missing file should be handled and return None."""
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+    res = await proc.process_pdf(Path("/nonexistent/file.pdf"))
+    assert res is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_failure_creates_error_report(isolate_fs_and_proc, sample_pdf):
+    """If extraction raises, an error report file should be written."""
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+
+    # Force extraction failure
+    with patch("backend.services.pdf_processor._extract_text_multi", side_effect=RuntimeError("Extraction failed")):
+        res = await proc.process_pdf(sample_pdf)
+
+    assert res is None
+    error_files = list(isolate_fs_and_proc["errs"].glob("*.error.json"))
+    assert len(error_files) == 1, "An error report should be created when extraction fails"
+    data = json.loads(error_files[0].read_text())
+    assert "events" in data and any("error" in ev for ev in data["events"])
+
+
+# -----------------------
+# ORIGINAL: TESTS: File Validation (safe settings replacement)
+# -----------------------
+@pytest.mark.asyncio
+async def test_large_file_rejection_using_safe_settings(isolate_fs_and_proc, tmp_path):
+    """Ensure oversized files are rejected using a fresh settings instance (no shared mutation)."""
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+
+    # Create a small file but we will simulate large by replacing settings safely
+    f = tmp_path / "large.pdf"
+    f.write_bytes(b"%PDF-1.4\n")
+
+    # Create a safe, copied settings object and set MAX_PDF_MB to 0 to force rejection
+    new_settings = deepcopy(proc.settings)
+    # Ensure attribute exists; name may differ depending on ProcessorSettings class
+    if hasattr(new_settings, "MAX_PDF_MB"):
+        new_settings.MAX_PDF_MB = 0
+    elif hasattr(new_settings, "MAX_PDF_SIZE_MB"):
+        new_settings.MAX_PDF_SIZE_MB = 0
+    proc.settings = new_settings
+
+    res = await proc.process_pdf(f)
+    assert res is None
+
+
+# -----------------------
+# ORIGINAL: TESTS: Utility Functions
+# -----------------------
+def test_atomic_write_json(tmp_path):
+    """Test atomic JSON write and overwrite semantics."""
+    test_file = tmp_path / "test.json"
+    _atomic_write_json(test_file, {"a": 1})
+    assert test_file.exists()
+    assert json.loads(test_file.read_text())["a"] == 1
+
+    # Overwrite
+    _atomic_write_json(test_file, {"a": 2})
+    assert json.loads(test_file.read_text())["a"] == 2
+
+
+def test_sha1_computation(tmp_path):
+    """SHA1 should match expected digest."""
+    test_file = tmp_path / "test.bin"
+    content = b"hello world"
+    test_file.write_bytes(content)
+    h = _compute_sha1(test_file)
+    assert isinstance(h, str) and len(h) == 40
+    assert h == hashlib.sha1(content).hexdigest()
+
+
+# -----------------------
+# ORIGINAL: TESTS: Health & Settings Validation
+# -----------------------
+def test_health_check_returns_structure(isolate_fs_and_proc):
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+    # health_check is a method on the instance
+    health = proc.health_check()
+    assert isinstance(health, dict)
+    assert "status" in health and "checks" in health
+    assert isinstance(health["checks"], dict)
+
+
+def test_settings_validation_rejects_invalid_values():
+    """Pydantic settings should reject invalid values (ValidationError)."""
+    from pydantic import ValidationError
+
+    # Valid instantiation should work
+    s = PDFProcessorSettings(MAX_PDF_MB=150, MAX_PAGES=100, MAX_TEXT_CHARS=50000)
+    assert s.MAX_PDF_MB == 150
+
+    # Invalid value should raise ValidationError (e.g., negative pages or 0)
+    with pytest.raises(ValidationError):
+        PDFProcessorSettings(MAX_PDF_MB=0)  # below ge=1 if defined
+
+
+# -----------------------
+# ORIGINAL: TESTS: Instance Executor Shutdown (robust)
+# -----------------------
+
+def test_instance_executor_shutdown_on_del(isolate_fs_and_proc):
+    \"\"\"Ensure executor is shutdown after explicit close() or instance deletion.
+    This test is implementation-tolerant: it prefers explicit close() and then
+    checks that the executor reports being shut down (private attr) or is None.
+    \"\"\"
+    proc = isolate_fs_and_proc["proc"]
+    ex = getattr(proc, "_executor", None)
+    assert ex is not None, "Executor should be created"
+
+    # Prefer explicit close() as production code should provide it.
+    try:
+        proc.close()
+    except Exception:
+        # tolerate code that doesn't implement close()
+        pass
+
+    # If executor exposes private flag, check it; otherwise check that attribute is None
+    shutdown_flag = getattr(ex, "_shutdown", None)
+    if shutdown_flag is not None:
+        assert shutdown_flag is True, "Executor should be shutdown after close()"
+    else:
+        # fallback: check attribute cleared
+        assert getattr(proc, "_executor", None) is None, "Executor attribute should be cleared after close()"
+
+def test_module_imports_with_no_backend_services(monkeypatch):
+    \"\"\"Ensure module handles missing backend.services gracefully.
+    We don't rely on brittle importlib.reload logic; instead we simulate the absence
+    of service objects and verify processor can be instantiated.
+    \"\"\"
+    # Save current state
+    saved = {k: sys.modules.get(k) for k in list(sys.modules.keys()) if k.startswith("backend.services")}
+    try:
+        # Remove backend.services.* modules from sys.modules
+        for k in list(sys.modules.keys()):
+            if k.startswith("backend.services"):
+                del sys.modules[k]
+        # Also monkeypatch service attributes if present
+        monkeypatch.setattr(pdf_proc, "_SERVICES_AVAILABLE", False, raising=False)
+        monkeypatch.setattr(pdf_proc, "llm_utils", None, raising=False)
+        monkeypatch.setattr(pdf_proc, "sentiment_utils", None, raising=False)
+        monkeypatch.setattr(pdf_proc, "aws_utils", None, raising=False)
+        monkeypatch.setattr(pdf_proc, "csv_utils", None, raising=False)
+        monkeypatch.setattr(pdf_proc, "filename_utils", None, raising=False)
+
+        # We should be able to create a processor; it must not raise on import-time absent services
+        proc = MasterPDFProcessor()
+        assert proc is not None
+    finally:
+        # restore modules
+        sys.modules.update({k: v for k, v in saved.items() if v is not None})
+        # restore flag if present
+        monkeypatch.setenv("DUMMY_RESTORE", "1")
+
+    """Module import handles missing backend.services by setting _SERVICES_AVAILABLE False."""
+    # preserve original values
+    orig_flag = getattr(pdf_proc, "_SERVICES_AVAILABLE", True)
+    orig_llm = getattr(pdf_proc, "llm_utils", None)
+    try:
+        monkeypatch.setattr(pdf_proc, "_SERVICES_AVAILABLE", False)
+        monkeypatch.setattr(pdf_proc, "llm_utils", None)
+        monkeypatch.setattr(pdf_proc, "sentiment_utils", None)
+        monkeypatch.setattr(pdf_proc, "aws_utils", None)
+        monkeypatch.setattr(pdf_proc, "csv_utils", None)
+        monkeypatch.setattr(pdf_proc, "filename_utils", None)
+
+        assert hasattr(pdf_proc, "_SERVICES_AVAILABLE")
+        assert pdf_proc._SERVICES_AVAILABLE is False
+
+        proc = MasterPDFProcessor()
+        assert proc is not None
+    finally:
+        monkeypatch.setattr(pdf_proc, "_SERVICES_AVAILABLE", orig_flag)
+        if orig_llm is not None:
+            monkeypatch.setattr(pdf_proc, "llm_utils", orig_llm)
+
+
+def test_startup_validation_with_missing_binaries(monkeypatch):
+    # Make shutil.which return None to simulate missing binaries
+    import shutil as _sh
+    monkeypatch.setattr(_sh, "which", lambda name: None)
+    # Module may expose a validate_runtime_requirements helper; if not, call health_check on a fresh processor
+    if hasattr(pdf_proc, "validate_runtime_requirements"):
+        report = pdf_proc.validate_runtime_requirements(pdf_proc._SETTINGS)
+        assert report is not None
+        assert report.get("ok") is False
+        assert any("Missing native" in str(i) or "tesseract" in str(i).lower() for i in report.get("issues", []))
+    else:
+        # fallback: call health_check and assert native binary checks note false
+        proc = MasterPDFProcessor()
+        health = proc.health_check()
+        natives = health.get("checks", {}).get("native_binaries", {})
+        assert isinstance(natives, dict)
+        # As we forced shutil.which to None, expect False for tesseract/pdftoppm keys
+        assert not natives.get("tesseract", True)
+
+
+# 4) EXECUTOR LIFECYCLE MANAGEMENT: ensure global executor is created/shutdown cleanly
+def test_global_executor_shutdown_and_cleanup():
+    # Temporarily set a small max_workers
+    old_workers = getattr(pdf_proc._SETTINGS, "THREADPOOL_MAX_WORKERS", None)
+    try:
+        if hasattr(pdf_proc._SETTINGS, "THREADPOOL_MAX_WORKERS"):
+            pdf_proc._SETTINGS.THREADPOOL_MAX_WORKERS = 2
+        # Ensure fresh executor
+        shutdown_global_executor(wait=True)
+        ex = _get_global_executor()
+        assert ex is not None
+        # Shutdown and ensure a new executor object will be created next call
+        shutdown_global_executor(wait=True)
+        ex2 = _get_global_executor()
+        assert ex2 is not ex
+    finally:
+        if old_workers is not None:
+            pdf_proc._SETTINGS.THREADPOOL_MAX_WORKERS = old_workers
+        shutdown_global_executor(wait=True)
+
+
+# 5) LLM FALLBACK: heuristic headline when llm unavailable
+@pytest.mark.asyncio
+async def test_heuristic_headline_when_llm_unavailable(isolate_fs_and_proc, sample_pdf):
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+    # disable services so _call_llm_* won't run
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(pdf_proc, "_SERVICES_AVAILABLE", False)
+    monkey.setattr(pdf_proc, "llm_utils", None)
+    # Patch module-level extractor to return sample long text
+    with patch("backend.services.pdf_processor._extract_text_multi", new=AsyncMock(return_value=(
+        "This is the first sentence. This is the second sentence used to expand summary.",
+        [{"page": 1, "text": "t", "ocr": False}], {"successful_method": "pypdf"}
+    ))):
+        res = await proc.process_pdf(sample_pdf)
+    monkey.undo()
+    assert res is not None
+    assert res.headline is not None
+    assert "This is the first sentence" in res.headline or "This is the first" in res.headline
+
+
+# 6) HEALTH CHECK VARIATIONS: S3 configured but missing prefix -> degraded
+def test_health_check_variations_for_s3_and_binaries(monkeypatch, isolate_fs_and_proc):
+    proc: MasterPDFProcessor = isolate_fs_and_proc["proc"]
+    # enable S3 upload but leave prefix empty
+    monkeypatch.setattr(proc.settings, "S3_UPLOAD_ON_COMPLETE", True)
+    monkeypatch.setattr(proc.settings, "S3_OUTPUT_PREFIX", None)
+    # also simulate missing natives
+    import shutil as _sh
+    monkeypatch.setattr(_sh, "which", lambda name: None)
+    health = proc.health_check()
+    assert isinstance(health, dict)
+    # Expect degraded or unhealthy status
+    assert health["status"] in ("degraded", "unhealthy", "down")
+    # s3_config_warning or native_binaries issues should be present
+    assert ("s3_config_warning" in health["checks"]) or ("native_binaries" in health["checks"])
+
+
+# 7) CONFIG VALIDATION: invalid S3 prefix raises on settings creation
+
+def test_configuration_validation_invalid_s3_prefix():
+    """Config validation should reject invalid S3 prefix (best-effort across pydantic versions)."""
+    try:
+        PDFProcessorSettings(S3_OUTPUT_PREFIX="invalid_prefix_without_slash")
+        pytest.fail("Expected validation error for invalid S3 prefix")
+    except Exception as e:
+        # Accept ValidationError or ValueError depending on pydantic version
+        assert "s3" in str(e).lower() or "prefix" in str(e).lower() or "validation" in str(e).lower()
+
+
+def test_concurrent_execution_limits_respected(monkeypatch):
+    old_workers = getattr(pdf_proc._SETTINGS, "THREADPOOL_MAX_WORKERS", None)
+    try:
+        if hasattr(pdf_proc._SETTINGS, "THREADPOOL_MAX_WORKERS"):
+            pdf_proc._SETTINGS.THREADPOOL_MAX_WORKERS = 3
+        shutdown_global_executor(wait=True)
+        ex = _get_global_executor()
+        # Some executor implementations expose _max_workers or _max_workers attribute
+        assert getattr(ex, "_max_workers", getattr(ex, "_max_workers", None)) in (3, None)
+    finally:
+        if old_workers is not None:
+            pdf_proc._SETTINGS.THREADPOOL_MAX_WORKERS = old_workers
+        shutdown_global_executor(wait=True)
+
+
+# -----------------------
+# ENTRYPOINT FOR LOCAL DEV
+# -----------------------
+if __name__ == "__main__":
+    import pytest as _pytest
+    _pytest.main([__file__, "-q"])
+
+
+@pytest.mark.asyncio
+async def test_ocr_fallback_when_primary_extractors_fail(isolate_fs_and_proc, monkeypatch, tmp_path):
+    \"\"\"Test OCR fallback: simulate primary extractors failing, ensure OCR path produces text.
+    We avoid assuming exact private method names; instead we patch the top-level extractor
+    function used by process_pdf: '_extract_text_multi' to simulate OCR result.
+    \"\"\"
+    proc = isolate_fs_and_proc["proc"]
+
+    # Ensure module settings allow OCR path if code uses it
+    try:
+        monkeypatch.setattr(pdf_proc._SETTINGS, "OCR_ENABLED", True, raising=False)
+    except Exception:
+        pass
+
+    # Simulate primary extractors raising inside the internal implementation by
+    # providing an _extract_text_multi that returns OCRed content (public-facing effect)
+    async def fake_extract_text_multi(path, max_pages=None, executor=None):
+        return ("OCRed full text", [{"page": 1, "text": "OCRed text", "ocr": True}], {"successful_method": "ocr"})
+
+    monkeypatch.setattr(pdf_proc, "_extract_text_multi", AsyncMock(side_effect=fake_extract_text_multi), raising=False)
+
+    # Run through the public API to exercise fallback behavior
+    result = await proc.process_pdf(tmp_path / "dummy.pdf")
+
+    assert result is not None
+    # At least one page should be flagged as OCR
+    pages = getattr(result, "pages", None) or getattr(result, "pages_extracted", None) or []
+    assert any(p.get("ocr") for p in pages), "OCR fallback did not produce pages marked as OCR"
+
+    """OCR fallback - uses public process_pdf and mocks primary extractors to fail."""
+    proc = isolate_fs_and_proc["proc"]
+
+    # Mock primary extractors to raise; ensure OCR helpers produce text
+    with patch.object(proc, "_extract_text_pymupdf", side_effect=Exception("fitz failed")), \
+         patch.object(proc, "_extract_text_pypdf", side_effect=Exception("pypdf failed")), \
+         patch.object(proc, "_extract_text_pdfplumber", side_effect=Exception("pdfplumber failed")), \
+         patch("backend.services.pdf_processor.convert_pdf_to_images") as mock_convert, \
+         patch("backend.services.pdf_processor.ocr_image") as mock_ocr:
+
+        mock_convert.return_value = ["img1.png"]
+        mock_ocr.return_value = "OCRed text"
+
+        # Ensure the public pipeline uses OCR fallback by stubbing the internal multi-extract
+        with patch("backend.services.pdf_processor._extract_text_multi") as mm:
+            mm.return_value = ("OCRed text", [{"page":1,"text":"OCRed text","ocr":True}], {"successful_method":"ocr"})
+            res = await proc.process_pdf(tmp_path/"dummy.pdf")
+
+        assert res is not None
+        # basic check that OCR result surfaced
+        assert "ocr" in str(res).lower() or "OCRed" in str(res)
+
+
+
+
+@pytest.mark.asyncio
+async def test_image_extraction_and_llm_run_concurrently(isolate_fs_and_proc, mock_services, sample_pdf):
+    \"\"\"Confirm images extraction and LLM run overlap (concurrency) using events.
+    This implementation avoids assuming exact signatures for mocked functions.
+    \"\"\"
+    proc = isolate_fs_and_proc["proc"]
+    with ServicesContext({
+        "llm_utils": mock_services["llm"],
+        "sentiment_utils": mock_services["sentiment"],
+        "csv_utils": mock_services["csv"],
+        "filename_utils": mock_services["filename"],
+    }):
+        image_started = asyncio.Event()
+        llm_started = asyncio.Event()
+        both_running = asyncio.Event()
+
+        async def images_fn(*args, **kwargs):
+            # signal started, then wait for LLM to start
+            image_started.set()
+            await llm_started.wait()
+            both_running.set()
+            # short sleep to ensure overlap
+            await asyncio.sleep(0.01)
+            return [{"page": 1, "index": 0, "filename": "i.png", "local_path": "/tmp/i.png", "s3_path": None, "width": 10, "height": 10}]
+
+        async def llm_fn(*args, **kwargs):
+            llm_started.set()
+            await image_started.wait()
+            both_running.set()
+            await asyncio.sleep(0.01)
+            return ("Headline", "Summary", {"model": "test"})
+
+        # Patch extractors robustly:
+        with patch("backend.services.pdf_processor._extract_text_multi", new=AsyncMock(return_value=(
+            "Sample text", [{"page": 1, "text": "t", "ocr": False}], {"successful_method": "pypdf"}
+        ))), \
+             patch("backend.services.pdf_processor._extract_images", new=AsyncMock(side_effect=images_fn)), \
+             patch("backend.services.pdf_processor._call_llm_headline_summary", new=AsyncMock(side_effect=llm_fn)):
+
+            task = asyncio.create_task(proc.process_pdf(sample_pdf))
+            try:
+                # Wait up to 2s for concurrency signal
+                await asyncio.wait_for(both_running.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                # if this fails, fail the test with useful message
+                pytest.fail("Concurrency between images extraction and LLM call not observed (timed out)")
+
+            # finish processing and assert it returned a result
+            result = await asyncio.wait_for(task, timeout=3.0)
+            assert result is not None
+
+    """Ensure image extraction and LLM run overlap (coordinate via Events)."""
+    proc = isolate_fs_and_proc["proc"]
+    with ServicesContext({
+        "llm_utils": mock_services["llm"],
+        "sentiment_utils": mock_services["sentiment"],
+        "csv_utils": mock_services["csv"],
+        "filename_utils": mock_services["filename"],
+    }):
+        image_started = asyncio.Event()
+        llm_started = asyncio.Event()
+        both = asyncio.Event()
+
+        async def images_fn(path, max_pages=None):
+            image_started.set()
+            await llm_started.wait()
+            both.set()
+            await asyncio.sleep(0.01)
+            return [{"page":1,"index":0,"filename":"i.png","local_path":"/tmp/i.png","s3_path":None,"width":10,"height":10}]
+
+        async def llm_fn(text, timeout_s=None):
+            llm_started.set()
+            await image_started.wait()
+            both.set()
+            await asyncio.sleep(0.01)
+            return ("H","S",{"m":"ok"})
+
+        with patch("backend.services.pdf_processor._extract_text_multi", new=AsyncMock(return_value=("T",[{"page":1,"text":"t","ocr":False}],{"successful_method":"pypdf"}))), \
+             patch("backend.services.pdf_processor._extract_images", side_effect=images_fn), \
+             patch("backend.services.pdf_processor._call_llm_headline_summary", side_effect=llm_fn):
+
+            task = asyncio.create_task(proc.process_pdf(sample_pdf))
+            await asyncio.wait_for(both.wait(), timeout=2.0)
+            res = await asyncio.wait_for(task, timeout=3.0)
+            assert res is not None
+

@@ -28,11 +28,11 @@ import logging
 import asyncio
 import re
 import random
-from typing import Optional, Dict, Any, Callable, Tuple
+from typing import Optional, Dict, Any, Callable, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread, Event, Lock
-from contextlib import asynccontextmanager
+ 
 
 # -------------------------
 # Optional project integrations (use when present)
@@ -55,15 +55,18 @@ except Exception:
 # OpenAI SDK support (best-effort)
 # Prefer the modern async client when available; fallback to sync client.
 # -------------------------
-_OPENAI_AVAILABLE = False
+_openai_available = False
 try:
-    import openai  # type: ignore
-    # some installations expose AsyncOpenAI as class; others don't.
-    # We'll use the public openai package functions and adapt.
-    _OPENAI_AVAILABLE = True
+    from openai import OpenAI  # type: ignore
+    _openai_available = True
 except Exception:
-    openai = None  # type: ignore
-    _OPENAI_AVAILABLE = False
+    OpenAI = None  # type: ignore
+    _openai_available = False
+
+if TYPE_CHECKING:
+    from openai import OpenAI as OpenAIClient  # type: ignore
+else:
+    OpenAIClient = Any
 
 # -------------------------
 # JSON extraction helper (regex optimized if available)
@@ -112,8 +115,18 @@ def _audit_event(name: str, details: Dict[str, Any]) -> None:
 
 # -------------------------
 # Configurable constants (env-overridable)
+# Environment variables recognised:
+#   OPENAI_API_KEY             -> standard OpenAI auth token
+#   OPENAI_MODEL               -> default chat/completions model
+#   LLM_DEFAULT_MAX_TOKENS     -> fallback max tokens per call
+#   LLM_DEFAULT_TEMPERATURE    -> default sampling temperature
+#   LLM_MAX_INPUT_CHARS        -> max characters accepted per request
+#   LLM_MAX_RETRIES            -> overrides retry attempts
+#   LLM_BACKOFF_BASE / LLM_BACKOFF_MAX (optional) for backoff tuning
+#   LLM_CONCURRENCY_LIMIT      -> semaphore size for concurrent calls
+#   LLM_THREADPOOL_MAX_WORKERS -> executor size for sync bridge
 # -------------------------
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_MAX_TOKENS = int(os.getenv("LLM_DEFAULT_MAX_TOKENS", "300"))
 DEFAULT_TEMPERATURE = float(os.getenv("LLM_DEFAULT_TEMPERATURE", "0.2"))
 MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "4000"))
@@ -144,6 +157,30 @@ _threadpool_lock = Lock()
 
 # semaphore for coarse concurrency limiting at async layer
 _async_semaphore: Optional[asyncio.Semaphore] = None
+
+_openai_client: Optional[OpenAIClient] = None
+_openai_client_lock = Lock()
+
+
+def _get_openai_client() -> OpenAIClient:
+    if not _openai_available or OpenAI is None:
+        raise RuntimeError("openai package not installed")
+    global _openai_client
+    if _openai_client is None:
+        with _openai_client_lock:
+            if _openai_client is None:
+                client_kwargs: Dict[str, Any] = {}
+                api_key = os.getenv("OPENAI_API_KEY")
+                if api_key:
+                    client_kwargs["api_key"] = api_key
+                base_url = os.getenv("OPENAI_BASE_URL")
+                if base_url:
+                    client_kwargs["base_url"] = base_url
+                organization = os.getenv("OPENAI_ORG") or os.getenv("OPENAI_ORGANIZATION")
+                if organization:
+                    client_kwargs["organization"] = organization
+                _openai_client = OpenAI(**client_kwargs)
+    return _openai_client  # type: ignore[return-value]
 
 def _get_threadpool() -> ThreadPoolExecutor:
     global _threadpool
@@ -378,90 +415,30 @@ async def _invoke_llm_native(
     timeout: Optional[float],
 ) -> Tuple[bool, Any]:
     """
-    Attempt to call the OpenAI API.
-    Use async-capable API if present (openai acreate / AsyncOpenAI),
-    else call the sync client in a threadpool.
+    Attempt to call the OpenAI API using the modern OpenAI client.
     Returns (ok, response_or_exception)
     """
-    if not _OPENAI_AVAILABLE:
+    if not _openai_available or OpenAI is None:
         return False, RuntimeError("openai package not installed")
 
-    # Check for OpenAI v1.0+ client (preferred)
-    if hasattr(openai, "OpenAI"):
-        try:
-            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            # Use sync create in threadpool for v1+ client
-            loop = asyncio.get_running_loop()
-            def _sync_call_v1():
-                try:
-                    return client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                    )
-                except Exception as ex:
-                    return ex
-            pool = _get_threadpool()
-            resp_or_exc = await loop.run_in_executor(pool, _sync_call_v1)
-            if isinstance(resp_or_exc, Exception):
-                return False, resp_or_exc
-            return True, resp_or_exc
-        except Exception as e:
-            logger.debug("OpenAI v1+ client failed: %s", _safe_str(e))
-
-    # Fallback to legacy API (for older versions)
-    # try to use the modern async endpoints if they exist
-    # Some OpenAI packages expose 'ChatCompletion.acreate' for async usage.
-    try:
-        # prefer asynchronous method if available
-        chat = getattr(openai, "ChatCompletion", None)
-        if chat and hasattr(chat, "acreate"):
-            # e.g., openai.ChatCompletion.acreate(...)
-            resp = await chat.acreate(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
-            return True, resp
-    except Exception as e:
-        # fallback path below; treat as non-fatal for now
-        logger.debug("async acreate failed, will try sync path: %s", _safe_str(e))
-
-    # fallback: call sync create in executor (works with legacy or modern sync client)
+    client = _get_openai_client()
     loop = asyncio.get_running_loop()
-    def _call_openai_sync(model, prompt, max_tokens, temperature):
-        # 1) Try new v1+ client shape: client = openai.OpenAI()
-        OpenAIClass = getattr(openai, "OpenAI", None)
-        if OpenAIClass is not None:
-            try:
-                client = OpenAIClass()
-                # v1+ sync path: client.chat.completions.create(...)
-                chat_iface = getattr(client, "chat", None)
-                if chat_iface is not None:
-                    comps = getattr(chat_iface, "completions", None)
-                    if comps is not None and hasattr(comps, "create"):
-                        return comps.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
-            except Exception:
-                # keep trying fallbacks
-                pass
+    request_args: Dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if timeout is not None:
+        request_args["timeout"] = timeout
 
-        # 2) Older library compatibility: openai.ChatCompletion.create(...)
-        ChatCompletion = getattr(openai, "ChatCompletion", None)
-        if ChatCompletion is not None and hasattr(ChatCompletion, "create"):
-            try:
-                return ChatCompletion.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
-            except Exception:
-                # If this errors due to migrated API, continue to next fallback
-                pass
+    def _call_chat_completion() -> Any:
+        try:
+            return client.chat.completions.create(**request_args)
+        except Exception as exc:
+            return exc
 
-        # 3) Legacy text completions fallback (older SDKs)
-        Completion = getattr(openai, "Completion", None)
-        if Completion is not None and hasattr(Completion, "create"):
-            return Completion.create(model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
-
-        # Nothing compatible found
-        raise RuntimeError("No compatible openai ChatCompletion/Completion API found (check openai SDK version).")
-
-    # Use the helper for the synchronous call site
-    pool = _get_threadpool()
-    resp_or_exc = await loop.run_in_executor(pool, _call_openai_sync, model, prompt, max_tokens, temperature)
+    resp_or_exc = await loop.run_in_executor(_get_threadpool(), _call_chat_completion)
     if isinstance(resp_or_exc, Exception):
         return False, resp_or_exc
     return True, resp_or_exc
@@ -496,19 +473,21 @@ async def async_call_llm(
         sem = asyncio.Semaphore(CONCURRENCY_SEMAPHORE)
 
     async with sem:
+        attempt_counter = {"count": 0}
         last_exc: Optional[Exception] = None
-        for attempt in range(max_retries):
+
+        async def _single_attempt() -> Dict[str, Any]:
+            nonlocal last_exc
+            attempt_idx = attempt_counter["count"]
+            attempt_counter["count"] += 1
             try:
                 ok, resp = await _invoke_llm_native(sanitized, model, max_tokens, temperature, timeout)
                 if not ok:
-                    # resp is exception
                     raise resp if isinstance(resp, Exception) else RuntimeError(_safe_str(resp))
-                # success
+
                 metrics.end_ts = time.time()
-                # attempt to read usage tokens defensively
                 usage = None
                 try:
-                    # SDKs return usage either as attr or as key in dict
                     usage_obj = getattr(resp, "usage", None) if not isinstance(resp, dict) else resp.get("usage")
                     usage = _serialize_usage(usage_obj)
                     if usage:
@@ -527,8 +506,8 @@ async def async_call_llm(
                     pass
 
                 return {"ok": True, "resp": resp, "usage": usage, "metrics": metrics.to_dict()}
-            except Exception as e:
-                last_exc = e
+            except Exception as exc:
+                last_exc = exc
                 _inc_metric("llm.call.fail")
                 try:
                     if hasattr(_CB, "record_failure"):
@@ -536,17 +515,52 @@ async def async_call_llm(
                 except Exception:
                     pass
 
-                transient = _is_transient_exception(e)
-                logger.warning("LLM call attempt %d failed: %s (transient=%s)", attempt + 1, _safe_str(e), transient)
-                _audit_event("llm.call.attempt_fail", {"attempt": attempt + 1, "error": _safe_str(e), "transient": transient})
+                transient = _is_transient_exception(exc)
+                logger.warning(
+                    "LLM call attempt %d failed: %s (transient=%s)",
+                    attempt_idx + 1,
+                    _safe_str(exc),
+                    transient,
+                )
+                _audit_event(
+                    "llm.call.attempt_fail",
+                    {"attempt": attempt_idx + 1, "error": _safe_str(exc), "transient": transient},
+                )
+                raise
 
-                if attempt + 1 >= max_retries or not transient:
+        if _RESILIENCE_AVAILABLE and hasattr(resilience_utils, "retry_async"):
+            try:
+                return await resilience_utils.retry_async(
+                    _single_attempt,
+                    retries=max(0, max_retries - 1),
+                    backoff=BACKOFF_BASE,
+                    breaker=_CB if hasattr(_CB, "record_failure") else None,
+                )
+            except Exception as final_exc:
+                last_exc = last_exc or final_exc
+                metrics.end_ts = time.time()
+                _audit_event(
+                    "llm.call",
+                    {"status": "failed", "model": model, "error": _safe_str(final_exc), **metrics.to_dict()},
+                )
+                return {"ok": False, "error": _safe_str(final_exc), "metrics": metrics.to_dict()}
+
+        # Fallback manual retry if resilience_utils.retry_async unavailable
+        for attempt in range(max_retries):
+            try:
+                return await _single_attempt()
+            except Exception as exc:
+                last_exc = last_exc or exc
+                if attempt + 1 >= max_retries or not _is_transient_exception(exc):
                     metrics.end_ts = time.time()
-                    _audit_event("llm.call", {"status": "failed", "model": model, "error": _safe_str(e), **metrics.to_dict()})
-                    return {"ok": False, "error": _safe_str(e), "metrics": metrics.to_dict()}
-                # backoff and retry
+                    _audit_event(
+                        "llm.call",
+                        {"status": "failed", "model": model, "error": _safe_str(exc), **metrics.to_dict()},
+                    )
+                    return {"ok": False, "error": _safe_str(exc), "metrics": metrics.to_dict()}
                 await _async_backoff_sleep(attempt)
-        # unreachable
+
+        metrics.end_ts = time.time()
         return {"ok": False, "error": _safe_str(last_exc), "metrics": metrics.to_dict()}
 
 # -------------------------
@@ -595,11 +609,28 @@ async def async_classify_headline_and_summary(text: str) -> Dict[str, Any]:
         return {"headline_final": None, "summary_60": None, "llm_meta": {"ok": False, "reason": "empty_text"}}
 
     prompt = (
-        "You are a professional financial news editor. Reframe the headline under 20 words "
-        "with corrected grammar and natural phrasing. Then write a concise 60-70 word summary "
-        "focusing on what happened, why it matters, and who is involved. RETURN ONLY valid JSON "
-        "with fields 'headline' and 'summary_60'.\n\n"
-        f"{_sanitize_input(text)}"
+        "You are a financial announcement editor. Follow these rules precisely when rewriting the announcement.\n"
+        "Headline requirements:\n"
+        "- Maximum 20 words.\n"
+        "Reframe the headline under 20 words with corrected grammar, punctuation, and natural phrasing. "
+        "Ensure the headline reads like a real newspaper or article headline — complete and senseful, not a fragment. "
+        "Do NOT end mid-sentence, with ellipses, or with dangling words like 'for', 'of', or 'to'. "
+        "Always end with a full stop. "
+        "Use an action verb and include the main subject. Do NOT truncate sentences, do NOT end with ellipses, and DO end the headline with a single period. "
+         "Write a crisp, complete and grammatically correct headline of no more than 20 words. "
+        "- Exclude addresses, contact information, phone numbers, emails, CIN, or locations.\n"
+        "- Remove redundant company prefixes; keep only the announcement, event, or action (e.g., Board Meeting on Dividend).\n"
+        "- Output plain title text without quotation marks.\n"
+        "Summary requirements:\n"
+        "Then write a concise 60-70 word summary focusing on what happened, why it matters, and who is involved. "
+        "- Rewrite as 2 to 3 sentences totaling no more than 60-70 words.\n"
+        "- Capture only key business facts such as dates, purposes, results, or outcomes.\n"
+        "Exclude addresses, greetings, signatures, or disclaimers. "
+        "- Omit greetings, signatures, disclaimers, or filler phrases.\n"
+        "- Use clean, human phrasing with no ellipses or line breaks.\n"
+        "- Ensure the summary ends with a full stop.\n"
+        "Return ONLY valid JSON with keys 'headline' and 'summary_60'.\n\n"
+        f"Source text:\n{_sanitize_input(text)}"
     )
 
     res = await async_call_llm(prompt, max_tokens=400, temperature=0.0)
@@ -633,12 +664,42 @@ async def async_classify_headline_and_summary(text: str) -> Dict[str, Any]:
     except Exception:
         data = {}
 
-    headline_val = (data.get("headline") or "").strip() or None
-    summary_val = (data.get("summary_60") or "").strip() or None
+    headline_raw = data.get("headline") or ""
+    summary_raw = data.get("summary_60") or data.get("summary") or ""
 
-    # Apply word clamp to ensure summary_60 is at most 60 words
+    def _clean_output(val: str) -> str:
+        if not val:
+            return ""
+        cleaned = re.sub(r"\s+", " ", val.replace("\n", " ")).strip()
+        return cleaned
+
+    headline_val = _clean_output(headline_raw)
+    summary_val = _clean_output(summary_raw)
+
+    if summary_val and len(summary_val.split()) > 80:
+        summary_val = _clamp_to_n_words(summary_val, 80)
+
     if summary_val:
-        summary_val = _clamp_to_n_words(summary_val, 60)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", summary_val) if s.strip()]
+        if sentences and len(sentences) > 3:
+            sentences = sentences[:3]
+        summary_val = " ".join(sentences)
+        summary_val = _clean_output(summary_val)
+
+    if summary_val and summary_val[-1] not in ".!?":
+        summary_val = f"{summary_val}."
+
+    if not headline_val and summary_val:
+        headline_val = " ".join(summary_val.split()[:10]).strip()
+
+    if headline_val and len(headline_val.split()) > 20:
+        headline_val = _clamp_to_n_words(headline_val, 20)
+
+    headline_val = headline_val or None
+    summary_val = summary_val or None
+
+    if summary_val:
+        summary_val = _clamp_to_n_words(summary_val, 80)
 
     meta = {"ok": True, "usage": res.get("usage"), "metrics": res.get("metrics")}
     return {

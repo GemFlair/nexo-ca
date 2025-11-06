@@ -28,6 +28,15 @@
 #
 #  NOTE: This file includes thorough metrics/audit logging, resource cleanup,
 #  S3 fallback detection and atomic writes. Run `shasum -a 256` after commit.
+#  Metric keys exported by this module (for dashboards/alerting):
+#    * image_processor.processed
+#    * image_processor.failed.save
+#    * image_processor.failed.unexpected
+#    * image_processor.failed.open
+#    * image_processor.skipped.extension
+#    * image_processor.skipped.existing
+#    * image_processor.error.pillow_missing
+#    * image_processor.failed.single.not_a_file
 # ================================================================
 
 from __future__ import annotations
@@ -45,6 +54,18 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Exported metric keys for dashboards/tests
+METRIC_KEYS: tuple[str, ...] = (
+    "image_processor.processed",
+    "image_processor.failed.save",
+    "image_processor.failed.unexpected",
+    "image_processor.failed.open",
+    "image_processor.skipped.extension",
+    "image_processor.skipped.existing",
+    "image_processor.error.pillow_missing",
+    "image_processor.failed.single.not_a_file",
+)
 
 # --- Pillow (optional at runtime) ---
 try:
@@ -69,7 +90,7 @@ except Exception:
         _PYDANTIC_AVAILABLE = False
 
 # --- Internal modules (expected to exist in project) ---
-from backend.services import aws_utils
+from backend.services import aws_utils, env_utils
 
 # Observability (defensive import + fallbacks)
 try:
@@ -123,13 +144,19 @@ else:
                 logger.error(f"Direct call after resilience wrapper failed: {e}")
                 return False
 
-# --- Paths & constants ---
-BASE = Path(__file__).resolve().parents[1]
-INPUT_DATA_ROOT = BASE / "input_data" / "images"
-LOCAL_RAW_LOGOS = INPUT_DATA_ROOT / "raw_images" / "raw_logos"
-LOCAL_RAW_BANNERS = INPUT_DATA_ROOT / "raw_images" / "raw_banners"
-LOCAL_PROC_LOGOS = INPUT_DATA_ROOT / "processed_images" / "processed_logos"
-LOCAL_PROC_BANNERS = INPUT_DATA_ROOT / "processed_images" / "processed_banners"
+# --- Paths & constants (environment-aware, consistent with CSV/PDF processors) ---
+LOCAL_RAW_LOGOS = Path(env_utils.build_local_path(
+    env_utils.get('LOCAL_RAW_IMAGE_DIR', 'input_data/images/raw_images')
+)) / "raw_logos"
+LOCAL_RAW_BANNERS = Path(env_utils.build_local_path(
+    env_utils.get('LOCAL_RAW_IMAGE_DIR', 'input_data/images/raw_images')
+)) / "raw_banners"
+LOCAL_PROC_LOGOS = Path(env_utils.build_local_path(
+    env_utils.get('LOCAL_PROCESSED_IMAGE_DIR', 'output_data/processed_images')
+)) / "processed_logos"
+LOCAL_PROC_BANNERS = Path(env_utils.build_local_path(
+    env_utils.get('LOCAL_PROCESSED_IMAGE_DIR', 'output_data/processed_images')
+)) / "processed_banners"
 
 for _p in (LOCAL_PROC_LOGOS, LOCAL_PROC_BANNERS):
     try:
@@ -652,4 +679,5 @@ __all__ = [
     "reset_cached_image_settings",
     "LOCAL_PROC_LOGOS",
     "LOCAL_PROC_BANNERS",
+    "METRIC_KEYS",
 ]

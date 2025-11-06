@@ -60,8 +60,8 @@ Key Behaviours
 
 Notes
 -----
-- This module intentionally avoids side-effects (no .env mutation) for production;
-  .env is only loaded automatically in non-prod convenience mode (local dev).
+- Environment detection and .env loading are centralized in backend.services.env_utils;
+  this module performs no direct dotenv handling.
 - Call shutdown_thread_pool() during app shutdown (FastAPI lifespan) if using async wrappers.
 """
 
@@ -79,22 +79,9 @@ import logging
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import List, Optional, Tuple, Callable, Any, Dict
+from typing import List, Optional, Tuple, Callable, Dict
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
-
-# -------------------------
-# Optional environment loading (non-prod convenience)
-# -------------------------
-try:
-    if (os.getenv("ENVIRONMENT", "dev") or "").lower() != "prod":
-        from dotenv import load_dotenv  # type: ignore
-        _env_path = Path(__file__).resolve().parents[2] / ".env"
-        if _env_path.exists():
-            load_dotenv(dotenv_path=_env_path)
-except Exception:
-    # ignore; production environments should not rely on .env
-    pass
 
 # -------------------------
 # Optional third-party imports (feature enablement)
@@ -112,6 +99,11 @@ except Exception:
     ClientError = Exception  # type: ignore
 
 # -------------------------
+# Internal modules (expected to exist in project)
+# -------------------------
+from backend.services import env_utils
+
+# -------------------------
 # Logging (module-level only)
 # -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -124,19 +116,31 @@ if not logger.handlers:
 # -------------------------
 # Configuration & Constants
 # -------------------------
-BASE = Path(__file__).resolve().parents[1]
-
 # Local processed images directories (must match image_processor outputs)
-PROCESSED_LOGOS = BASE / "input_data" / "images" / "processed_images" / "processed_logos"
-PROCESSED_BANNERS = BASE / "input_data" / "images" / "processed_images" / "processed_banners"
+PROCESSED_LOGOS = Path(env_utils.build_local_path(
+    env_utils.get("LOCAL_PROCESSED_IMAGE_DIR", "output_data/processed_images")
+)) / "processed_logos"
+PROCESSED_BANNERS = Path(env_utils.build_local_path(
+    env_utils.get("LOCAL_PROCESSED_IMAGE_DIR", "output_data/processed_images")
+)) / "processed_banners"
 
 # Local URL base used by frontend static server
 URL_BASE = os.getenv("IMAGE_URL_BASE", "/static/images")
 PLACEHOLDER_LOGO = os.getenv("PLACEHOLDER_LOGO", "default_logo.png")
 PLACEHOLDER_BANNER = os.getenv("PLACEHOLDER_BANNER", "default_banner.webp")
 
+# Default S3 prefix for processed images (aligns with env_utils environment handling)
+# Use lazy evaluation to avoid RuntimeError in local_dev environment
+try:
+    _DEFAULT_S3_PROCESSED = env_utils.build_s3_path(
+        env_utils.get("S3_PROCESSED_IMAGE_DIR", "output_data/processed_images")
+    )
+except RuntimeError:
+    # In local_dev mode, S3 paths raise RuntimeError - use empty string as fallback
+    _DEFAULT_S3_PROCESSED = ""
+
 # S3 prefix for processed images (optional)
-S3_PROCESSED_IMAGES_PATH = (os.getenv("S3_PROCESSED_IMAGES_PATH") or "").strip()
+S3_PROCESSED_IMAGES_PATH = (os.getenv("S3_PROCESSED_IMAGES_PATH") or _DEFAULT_S3_PROCESSED).strip()
 # Optional CDN base URL for S3 assets
 CDN_BASE_URL = (os.getenv("CDN_BASE_URL") or "").strip()
 
@@ -631,6 +635,81 @@ async def async_get_banner_path(symbol: str, company_name: str) -> Tuple[ImageCa
     res = await loop.run_in_executor(pool, lambda: get_banner_path(symbol, company_name))
     return res
 
+
+# -------------------------
+# Helper functions for image processing and upload
+# -------------------------
+def process_and_upload_image(target_path, upload_prefix: Optional[str] = None, overwrite: bool = False) -> dict:
+    """
+    Uploads a local image file to S3 (if prefix provided) and returns a dict
+    containing local_path, s3_url, and public_url. Falls back gracefully if upload fails.
+    """
+    out = {"local_path": None, "s3_url": None, "public_url": None}
+    try:
+        from pathlib import Path
+        tp = Path(target_path)
+        if not tp.exists():
+            return out
+        out["local_path"] = str(tp)
+
+        # Try upload via aws_utils if available
+        try:
+            import backend.services.aws_utils as aws_utils  # type: ignore
+            if hasattr(aws_utils, "upload_file_to_s3"):
+                tgt = f"{upload_prefix.rstrip('/')}/{tp.name}" if upload_prefix else tp.name
+                ok = aws_utils.upload_file_to_s3(tp, tgt, overwrite=overwrite)
+                if ok:
+                    s3_uri = f"{upload_prefix.rstrip('/')}/{tp.name}" if upload_prefix else tp.name
+                    from backend.services.image_utils import _ensure_s3_uri, _url_for_candidate_remote, _s3_object_key_from_s3_uri, CDN_BASE_URL
+                    s3_uri = _ensure_s3_uri(s3_uri)
+                    out["s3_url"] = s3_uri
+                    if CDN_BASE_URL:
+                        key = _s3_object_key_from_s3_uri(s3_uri)
+                        out["public_url"] = _url_for_candidate_remote(key, s3_uri)
+                    else:
+                        out["public_url"] = s3_uri
+                    return out
+        except Exception:
+            pass
+
+        # If no upload, fallback to local only
+        return out
+    except Exception:
+        return out
+
+
+def detect_role_for_images(images: list) -> list:
+    """
+    Detects whether each image in the list is a logo or banner.
+    Uses filename keywords and aspect ratio heuristics.
+    Returns a list of dicts with keys:
+    index, role, local_path, s3_url, public_url
+    """
+    out = []
+    for img in images or []:
+        try:
+            fname = (img.get("filename") or "").lower()
+            w = img.get("width") or 0
+            h = img.get("height") or 0
+            role = None
+            if "logo" in fname:
+                role = "logo"
+            elif "banner" in fname or (w and h and (w / max(1, h) > 2 or h / max(1, w) > 2)):
+                role = "banner"
+            else:
+                if max(w, h) < 300:
+                    role = "logo"
+            public = img.get("s3_url") or img.get("local_path")
+            out.append({
+                "index": img.get("index"),
+                "role": role,
+                "local_path": img.get("local_path"),
+                "s3_url": img.get("s3_url"),
+                "public_url": public
+            })
+        except Exception:
+            out.append({"index": None, "role": None, "local_path": None, "s3_url": None, "public_url": None})
+    return out
 
 # -------------------------
 # CLI quick-check (safely importable)

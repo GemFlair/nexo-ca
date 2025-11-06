@@ -9,7 +9,7 @@ Also keeps rolling 3-day backups for both versions.
 """
 
 from __future__ import annotations
-import sys, os, json, shutil, glob, importlib.util
+import sys, os, json, shutil, glob
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -20,39 +20,9 @@ OUT_DIR = BASE_DIR / "data" / "master_data"
 OUT_PATH = OUT_DIR / "latest_marketdata.json"
 OUT_PATH_MIN = OUT_DIR / "latest_marketdata_min.json"
 
-
-# ---------------- Robust import of csv_utils ----------------
-def import_csv_utils():
-    try:
-        from backend.services import csv_utils as cu  # type: ignore
-        return cu
-    except Exception:
-        pass
-
-    try:
-        if str(BASE_DIR) not in sys.path:
-            sys.path.insert(0, str(BASE_DIR))
-        from services import csv_utils as cu  # type: ignore
-        return cu
-    except Exception:
-        pass
-
-    try:
-        fpath = BASE_DIR / "services" / "csv_utils.py"
-        if fpath.exists():
-            spec = importlib.util.spec_from_file_location("csv_utils_local", str(fpath))
-            module = importlib.util.module_from_spec(spec)
-            assert spec and spec.loader
-            spec.loader.exec_module(module)  # type: ignore
-            return module
-    except Exception:
-        pass
-
-    return None
-
-
-cu = import_csv_utils()
-if cu is None:
+try:
+    from backend.services import csv_utils as cu  # type: ignore
+except Exception:
     print("❌ ERROR: Unable to import backend.services.csv_utils.", file=sys.stderr)
     sys.exit(2)
 

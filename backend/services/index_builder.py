@@ -34,14 +34,8 @@ from typing import Optional, Dict, Any, Set, List, Tuple, Iterable
 from collections import defaultdict
 from difflib import SequenceMatcher
 
-# Defensive import of csv_utils (caller must ensure backend/ on PYTHONPATH)
-try:
-    from services import csv_utils  # type: ignore
-except Exception:  # pragma: no cover - defensive
-    try:
-        import csv_utils  # type: ignore
-    except Exception:
-        csv_utils = None  # type: ignore
+# csv_utils is accessed via the canonical backend package to avoid PYTHONPATH juggling
+from backend.services import csv_utils  # type: ignore
 
 # -------------------------
 # Module logger (module-level only)
@@ -569,6 +563,11 @@ def index_status() -> Dict[str, Any]:
         "company_norms": len(_company_norm_map),
     }
 
+
+def last_refresh_timestamp() -> Optional[float]:
+    """Return the epoch timestamp of the most recent successful index build."""
+    return _built_at
+
 # -------------------------
 # Eager build on import (controlled)
 # -------------------------
@@ -593,4 +592,5 @@ __all__ = [
     "token_overlap_search",
     "get_company_by_symbol",
     "index_status",
+    "last_refresh_timestamp",
 ]

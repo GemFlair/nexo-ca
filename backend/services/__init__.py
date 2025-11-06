@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib
 import os
 import types
-from pathlib import Path
 from typing import Optional, Dict
 
 __all__ = ["load_env", "csv_utils", "image_utils", "pdf_processor", "index_builder", "llm_utils", "sentiment_utils"]
@@ -31,19 +30,14 @@ sentiment_utils: Optional[types.ModuleType]
 
 _import_cache: Dict[str, Optional[types.ModuleType]] = {}
 
-def load_env(dotenv_path: Optional[Path] = None) -> None:
-    """Explicit .env loader; call manually from app startup (e.g. backend/main.py)."""
-    try:
-        from dotenv import load_dotenv  # type: ignore
-    except Exception:
-        return
+def load_env() -> None:
+    """
+    Delegates environment loading to backend.services.env_utils.
 
-    dotenv_path = dotenv_path or Path(__file__).resolve().parents[2] / ".env"
-    try:
-        if dotenv_path.exists():
-            load_dotenv(dotenv_path=str(dotenv_path))
-    except Exception:
-        pass  # silent; production should set env externally
+    env_utils handles all .env logic centrally, including file discovery and loading.
+    """
+    from backend.services import env_utils
+    env_utils.get_environment()
 
 
 def _lazy_import(name: str) -> Optional[types.ModuleType]:
