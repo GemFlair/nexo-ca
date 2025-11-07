@@ -91,6 +91,26 @@ except Exception as exc:
     ) from exc
 
 # -------------------------------------------------------------------------
+# Defensive fallback: ensure _sanitize_csv_value is always available
+# -------------------------------------------------------------------------
+if '_sanitize_csv_value' not in globals() or _sanitize_csv_value is None:
+    def _sanitize_csv_value(value):
+        """
+        Fallback CSV injection sanitizer if import from csv_processor failed.
+        Escapes leading formula characters (=, +, -, @) to prevent CSV injection.
+        """
+        if value is None:
+            return ""
+        s = str(value)
+        if not s:
+            return s
+        # Strip leading whitespace before checking
+        stripped = s.lstrip(" \t")
+        if stripped and stripped[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + stripped
+        return s
+
+# -------------------------------------------------------------------------
 # Helper: Convert numpy/pandas objects into JSON-safe Python primitives
 # -------------------------------------------------------------------------
 import numpy as _np
@@ -1082,7 +1102,9 @@ __all__ = [
     "find_latest_processed_eod", "load_processed_df", "async_load_processed_df",
     "get_market_snapshot", "async_get_market_snapshot", "load_indices_df",
     "get_indices_for_symbol", "list_symbols", "format_snapshot_for_display",
-    "preload_settings", "reset_cached_settings", "health_check", "shutdown_csv_utils"
+    "preload_settings", "reset_cached_settings", "health_check", "shutdown_csv_utils",
+    # Test helpers and utilities
+    "_sanitize_csv_value", "_is_path_safe", "_robust_float_convert", "_robust_percent_convert"
 ]
 
 if __name__ == "__main__":
