@@ -545,25 +545,23 @@ def shutdown_csv_executors() -> None:
     _shutdown_event.set()
     try:
         logger.info("Shutting down CSV processor...")
-    except Exception:
-        pass
-    global _executor
-    with _executor_lock:
-        if _executor:
-            try:
-                _executor.shutdown(wait=True, cancel_futures=True)
-            except TypeError:
-                 _executor.shutdown(wait=True)
-            except Exception:
-                logger.exception("Error during graceful executor shutdown")
-            _executor = None
-    if _METRICS_QUEUE:
-        _METRICS_QUEUE.put(None)
-    if _METRICS_WORKER_THREAD:
-        _METRICS_WORKER_THREAD.join(timeout=5)
-    try:
+        global _executor
+        with _executor_lock:
+            if _executor:
+                try:
+                    _executor.shutdown(wait=True, cancel_futures=True)
+                except TypeError:
+                     _executor.shutdown(wait=True)
+                except Exception:
+                    logger.exception("Error during graceful executor shutdown")
+                _executor = None
+        if _METRICS_QUEUE:
+            _METRICS_QUEUE.put(None)
+        if _METRICS_WORKER_THREAD:
+            _METRICS_WORKER_THREAD.join(timeout=5)
         logger.info("Shutdown complete.")
-    except (Exception, ValueError, OSError):
+    except ValueError:
+        # Ignore logging during interpreter shutdown
         pass
 
 atexit.register(shutdown_csv_executors)
