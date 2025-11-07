@@ -544,7 +544,12 @@ def shutdown_csv_executors() -> None:
         return
     _shutdown_event.set()
     try:
-        logger.info("Shutting down CSV processor...")
+        try:
+            logger.info("Shutting down CSV processor...")
+        except Exception:
+            # In test/CI environments the logging subsystem/handlers may already be closed.
+            # Swallow logging errors to avoid failing shutdown/atexit.
+            pass
         global _executor
         with _executor_lock:
             if _executor:
@@ -559,7 +564,11 @@ def shutdown_csv_executors() -> None:
             _METRICS_QUEUE.put(None)
         if _METRICS_WORKER_THREAD:
             _METRICS_WORKER_THREAD.join(timeout=5)
-        logger.info("Shutdown complete.")
+        try:
+            logger.info("Shutdown complete.")
+        except Exception:
+            # Logging may be unavailable during interpreter shutdown; ignore.
+            pass
     except ValueError:
         # Ignore logging during interpreter shutdown
         pass
