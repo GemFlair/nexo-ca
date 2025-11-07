@@ -2,8 +2,8 @@
 Lightweight services package initializer.
 
 Dual-Mode Support:
-- Core Mode (default): Only core API modules are lazy-accessible.
-- Full Mode: Set SERVICES_FULL_MODE=1 to enable lazy access to all submodules (for dev/debug).
+- Core Mode (default): Core API modules are eagerly imported and accessible.
+- Full Mode: Set SERVICES_FULL_MODE=1 to enable lazy access to dev-only submodules.
 """
 
 from __future__ import annotations
@@ -12,23 +12,13 @@ import os
 import types
 from typing import Optional, Dict
 
-__all__ = ["load_env", "csv_utils", "image_utils", "pdf_processor", "index_builder", "llm_utils", "sentiment_utils"]
-
 # --- Configuration ---
 FULL_MODE = os.getenv("SERVICES_FULL_MODE", "0").strip().lower() in ("1", "true", "yes")
 _core_allowed = ("csv_utils", "image_utils", "pdf_processor", "index_builder", "llm_utils", "sentiment_utils")
 _dev_only = ("image_processor", "csv_processor", "filename_utils", "pdf_watcher", "update_logo_and_patch_json")
 
-# --- Type hints for IDEs / linters ---
-# Note: Actual values are set lazily via __getattr__
-csv_utils: Optional[types.ModuleType]
-image_utils: Optional[types.ModuleType]
-pdf_processor: Optional[types.ModuleType]
-index_builder: Optional[types.ModuleType]
-llm_utils: Optional[types.ModuleType]
-sentiment_utils: Optional[types.ModuleType]
-
 _import_cache: Dict[str, Optional[types.ModuleType]] = {}
+
 
 def load_env() -> None:
     """
@@ -64,14 +54,30 @@ def _lazy_import(name: str) -> Optional[types.ModuleType]:
     return mod
 
 
+# --- Eagerly import core modules so they're available at package import time ---
+# This ensures "from backend.services import csv_utils" works correctly
+csv_utils = _lazy_import("csv_utils")
+image_utils = _lazy_import("image_utils")
+pdf_processor = _lazy_import("pdf_processor")
+index_builder = _lazy_import("index_builder")
+llm_utils = _lazy_import("llm_utils")
+sentiment_utils = _lazy_import("sentiment_utils")
+
+__all__ = ["load_env", "csv_utils", "image_utils", "pdf_processor", "index_builder", "llm_utils", "sentiment_utils"]
+
+
 def __getattr__(attr: str) -> Optional[types.ModuleType]:
     """
-    Lazy attribute resolver.
+    Lazy attribute resolver for dev-only modules.
 
-    - In core mode, only core modules are permitted.
-    - In full mode, all modules are accessible.
-    - Raises AttributeError if a *core* module fails to import.
+    - Core modules are already imported above.
+    - In full mode, dev-only modules are accessible via lazy loading.
+    - Raises AttributeError if module not allowed or fails to import.
     """
+    # If already imported (core modules), return from globals
+    if attr in globals():
+        return globals()[attr]
+
     allowed = _core_allowed + _dev_only if FULL_MODE else _core_allowed
 
     if attr not in allowed:
