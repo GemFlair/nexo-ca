@@ -70,7 +70,9 @@ def mock_settings(monkeypatch):
     monkeypatch.setenv("AWS_S3_SECRETS_NAME", "")
     monkeypatch.setenv("CSV_COLUMN_MAPPINGS", "")
     monkeypatch.setenv("LOG_FORMAT", "text") # Use text for easier log capture assertions
-    csv_utils.reset_cached_settings()
+    # Guard against None/missing reset_cached_settings during test initialization
+    if hasattr(csv_utils, "reset_cached_settings") and csv_utils.reset_cached_settings is not None:
+        csv_utils.reset_cached_settings()
     yield monkeypatch
 
 @pytest.fixture(scope="function")
@@ -99,14 +101,22 @@ def local_fs(fs):
 @pytest.fixture(autouse=True)
 def reset_module_caches():
     """Ensures all module-level caches are cleared between tests for isolation."""
-    csv_utils.reset_cached_settings()
+    # Guard against None/missing reset_cached_settings during test initialization
+    if hasattr(csv_utils, "reset_cached_settings") and csv_utils.reset_cached_settings is not None:
+        csv_utils.reset_cached_settings()
     # Manually reset the internal DataFrame caches
-    csv_utils._EOD_DF = None
-    csv_utils._EOD_PATH = None
-    csv_utils._EOD_CACHE_TS = 0.0
-    csv_utils._INDICES_DF = None
-    csv_utils._INDICES_PATH = None
-    csv_utils._INDICES_CACHE_TS = 0.0
+    if hasattr(csv_utils, "_EOD_DF"):
+        csv_utils._EOD_DF = None
+    if hasattr(csv_utils, "_EOD_PATH"):
+        csv_utils._EOD_PATH = None
+    if hasattr(csv_utils, "_EOD_CACHE_TS"):
+        csv_utils._EOD_CACHE_TS = 0.0
+    if hasattr(csv_utils, "_INDICES_DF"):
+        csv_utils._INDICES_DF = None
+    if hasattr(csv_utils, "_INDICES_PATH"):
+        csv_utils._INDICES_PATH = None
+    if hasattr(csv_utils, "_INDICES_CACHE_TS"):
+        csv_utils._INDICES_CACHE_TS = 0.0
     yield
 
 
