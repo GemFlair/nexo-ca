@@ -563,7 +563,7 @@ def shutdown_csv_executors() -> None:
         _METRICS_WORKER_THREAD.join(timeout=5)
     try:
         logger.info("Shutdown complete.")
-    except Exception:
+    except (Exception, ValueError, OSError):
         pass
 
 atexit.register(shutdown_csv_executors)
