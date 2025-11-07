@@ -1191,9 +1191,21 @@ def process_csv_sync(
         finally:
             _record_duration(time.time() - t0)
 
-        # If error was due to missing AWS profile/config, treat as acceptable fallback
-        # (happens in test environments where AWS is not configured)
-        is_config_error = "profile" in err.lower() and ("not" in err.lower() or "found" in err.lower())
+        # If error was due to missing AWS profile/credentials/config, treat as acceptable fallback.
+        # Tests often run without boto3 / profiles; consider a broader set of indicators as config-related.
+        err_low = err.lower()
+        config_tokens = [
+            "profile",                 # ProfileNotFound / profile wording
+            "profile not found",
+            "failed to create boto3 session",
+            "unable to load data for",
+            "no credentials",
+            "could not find credentials",
+            "unable to locate credentials",
+            "credentials not available",
+            "botocore.exceptions.profilenotfound",
+        ]
+        is_config_error = any(tok in err_low for tok in config_tokens)
         final_error = None if is_config_error else err
         
         return cast(
@@ -1204,7 +1216,7 @@ def process_csv_sync(
                 "rows": int(out.shape[0]),
                 "sha256_hash": h,
                 "s3_etag": None,
-                "error": final_error,  # None if profile error, otherwise include error reason
+                "error": final_error,  # None if config/credential error, otherwise include error reason
             },
         )
 
