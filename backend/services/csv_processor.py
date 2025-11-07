@@ -872,15 +872,41 @@ def process_csv_sync(input_path: str, verbose: bool = False, output_path: Option
                 _audit_log("process_csv.write", out_path, "success", {"rows": len(sanitized_out), "etag": etag})
                 return cast(ProcessResult, {"path": out_path, "s3": True, "rows": len(sanitized_out), "sha256_hash": None, "s3_etag": etag, "error": None})
             except Exception as e:
-                logger.exception("S3 write failed; falling back to local")
+                # Capture the textual error immediately and normalize it so we never return None/empty.
+                str_err = str(e) if str(e) else repr(e)
+                try:
+                    logger.exception("S3 write failed; falling back to local: %s", str_err)
+                except Exception:
+                    # Avoid failing shutdown/logging issues from bubbling up during tests
+                    pass
+
                 _increment_fallback_metric()
-                _audit_log("process_csv.write", out_path, "failure_fallback", {"error": str(e)})
+                _audit_log("process_csv.write", out_path, "failure_fallback", {"error": str_err})
+
+                # Compute fallback path and write locally
                 fallback_path = str(Path(LOCAL_PROCESSED_DIR, Path(safe_name).name))
                 _atomic_local_write_csv(fallback_path, sanitized_out)
+
+                # Calculate hash (can be None if it fails)
                 output_hash = _calculate_sha256_hash(fallback_path)
-                _audit_log("process_csv.write", fallback_path, "success_fallback", {"rows": len(sanitized_out), "hash": output_hash})
-                logger.warning(f"Fallback triggered with error: {e}")
-                return cast(ProcessResult, {"path": fallback_path, "s3": False, "rows": len(sanitized_out), "sha256_hash": output_hash, "s3_etag": None, "error": str(e)})
+                _audit_log("process_csv.write", fallback_path, "success_fallback",
+                           {"rows": len(sanitized_out), "hash": output_hash})
+
+                # Also emit a warning with the captured message (use str_err)
+                try:
+                    logger.warning("Fallback triggered with error: %s", str_err)
+                except Exception:
+                    pass
+
+                # Build and return the ProcessResult explicitly using the captured error string
+                return cast(ProcessResult, {
+                    "path": fallback_path,
+                    "s3": False,
+                    "rows": len(sanitized_out),
+                    "sha256_hash": output_hash,
+                    "s3_etag": None,
+                    "error": str_err
+                })
         else:
             _atomic_local_write_csv(out_path, sanitized_out)
             output_hash = _calculate_sha256_hash(out_path)
