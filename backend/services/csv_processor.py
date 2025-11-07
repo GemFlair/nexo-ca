@@ -107,6 +107,20 @@ logger = ContextInjectingAdapter(logging.getLogger(__name__), {})
 logger.logger.addHandler(logging.NullHandler())
 
 
+# --- Logging Helpers ---
+import contextlib
+
+@contextlib.contextmanager
+def _suppress_logging_raise_exceptions():
+    """Temporarily disable logging.raiseExceptions to prevent handler tracebacks during shutdown."""
+    prev = logging.raiseExceptions
+    logging.raiseExceptions = False
+    try:
+        yield
+    finally:
+        logging.raiseExceptions = prev
+
+
 # --- Typed Return ---
 class ProcessResult(TypedDict):
     path: str
@@ -544,12 +558,8 @@ def shutdown_csv_executors() -> None:
         return
     _shutdown_event.set()
     try:
-        try:
+        with _suppress_logging_raise_exceptions():
             logger.info("Shutting down CSV processor...")
-        except Exception:
-            # In test/CI environments the logging subsystem/handlers may already be closed.
-            # Swallow logging errors to avoid failing shutdown/atexit.
-            pass
         global _executor
         with _executor_lock:
             if _executor:
@@ -564,11 +574,8 @@ def shutdown_csv_executors() -> None:
             _METRICS_QUEUE.put(None)
         if _METRICS_WORKER_THREAD:
             _METRICS_WORKER_THREAD.join(timeout=5)
-        try:
+        with _suppress_logging_raise_exceptions():
             logger.info("Shutdown complete.")
-        except Exception:
-            # Logging may be unavailable during interpreter shutdown; ignore.
-            pass
     except ValueError:
         # Ignore logging during interpreter shutdown
         pass
