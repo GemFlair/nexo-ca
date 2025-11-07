@@ -190,7 +190,7 @@ class TestResilienceAndFallbacks:
         mocker.patch.object(csv_processor, '_get_s3_fs', return_value=mock_fs)
 
         # Force S3 write to fail to trigger fallback
-        mocker.patch.object(csv_processor, '_write_s3_csv_sync', side_effect=IOError("S3 is down!"))
+        mocker.patch("backend.services.csv_processor._write_s3_csv_sync", side_effect=IOError("S3 is down!"))
 
         # Act
         result = csv_processor.process_csv_sync(s3_path)

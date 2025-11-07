@@ -865,6 +865,7 @@ def process_csv_sync(input_path: str, verbose: bool = False, output_path: Option
                 _atomic_local_write_csv(fallback_path, sanitized_out)
                 output_hash = _calculate_sha256_hash(fallback_path)
                 _audit_log("process_csv.write", fallback_path, "success_fallback", {"rows": len(sanitized_out), "hash": output_hash})
+                logger.warning(f"Fallback triggered with error: {e}")
                 return cast(ProcessResult, {"path": fallback_path, "s3": False, "rows": len(sanitized_out), "sha256_hash": output_hash, "s3_etag": None, "error": str(e)})
         else:
             _atomic_local_write_csv(out_path, sanitized_out)
