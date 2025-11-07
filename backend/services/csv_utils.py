@@ -63,22 +63,20 @@ try:
     from backend.services.csv_processor import (
         get_csv_settings,
         _get_s3_fs,
-        _get_executor,
+        _load_s3_options,
+        _get_threadpool,
         _retry_call_sync,
         CircuitBreaker,
         correlation_id_var,
-        _audit_log,
-        _increment_error_metric,
+        _audit,
+        _inc_error,
         _is_s3_uri,
-        _sanitize_config,
         LOCAL_PROCESSED_DIR,
-        LOCAL_STATIC_DIR,
         _parse_s3_storage_options,
         boto3,  # may be None if not installed but import succeeds
         # Additional imports for comprehensive testing
         _sanitize_csv_value,
         _robust_float_convert,
-        _robust_percent_convert,
         find_latest_csv_sync,
         process_csv_sync,
         configure_logging_from_settings,
@@ -89,6 +87,37 @@ except Exception as exc:
         "csv_utils requires backend.services.csv_processor to be importable. "
         "Fix the import error in csv_processor."
     ) from exc
+
+# Define missing constants and functions that were removed from csv_processor
+from pathlib import Path as _Path
+LOCAL_STATIC_DIR = str(_Path(LOCAL_PROCESSED_DIR).parent / "static")
+
+def _robust_percent_convert(v: Any) -> Optional[float]:
+    """
+    Fallback robust percent converter.
+    Handles strings like "25.5%" and converts to float 25.5.
+    """
+    if v is None or (isinstance(v, float) and _pd.isna(v)):
+        return None
+    s = str(v).strip()
+    if s.endswith("%"):
+        s = s[:-1].strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+# -------------------------------------------------------------------------
+# Compatibility wrappers for function name changes
+# -------------------------------------------------------------------------
+def _audit_log(action: str, resource: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+    """Compatibility wrapper for _audit with old signature."""
+    event = f"{action}.{status}"
+    _audit(event, {**(details or {}), "resource": resource})
+
+def _increment_error_metric(kind: str) -> None:
+    """Compatibility wrapper for _inc_error."""
+    _inc_error(kind)
 
 # -------------------------------------------------------------------------
 # Defensive fallback: ensure _sanitize_csv_value is always available
@@ -448,7 +477,8 @@ def _read_csv_resilient(path: Union[str, Path]) -> pd.DataFrame:
             acquired = sem.acquire(timeout=int(settings.S3_OP_TIMEOUT)) if sem else True
             try:
                 try:
-                    fs = _get_s3_fs()
+                    opts = _load_s3_options()
+                    fs = _get_s3_fs(opts)
                     with fs.open(pstr, "rb") as fh:
                         try:
                             return pd.read_csv(fh, low_memory=False)
@@ -504,7 +534,8 @@ def find_latest_processed_eod() -> Optional[Union[Path, str]]:
     # S3 branch
     if isinstance(processed_dir, str) and _is_s3_uri(processed_dir):
         try:
-            fs = _get_s3_fs()
+            opts = _load_s3_options()
+            fs = _get_s3_fs(opts)
             prefix = processed_dir.rstrip("/")
             candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
             candidates = [(_ensure_s3_uri(str(x))) for x in candidates]
@@ -769,7 +800,8 @@ def load_indices_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
 
     if isinstance(static_dir, str) and _is_s3_uri(static_dir):
         try:
-            fs = _get_s3_fs()
+            opts = _load_s3_options()
+            fs = _get_s3_fs(opts)
             prefix = static_dir.rstrip("/")
             entries = fs.glob(f"{prefix}/*.csv")
             for e in entries:
@@ -965,7 +997,7 @@ async def async_load_processed_df(force_reload: bool = False) -> Optional[pd.Dat
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
     func = partial(load_processed_df, force_reload)
-    return await loop.run_in_executor(_get_executor(), ctx.run, func)
+    return await loop.run_in_executor(_get_threadpool(), ctx.run, func)
 
 async def async_get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
     """
@@ -976,7 +1008,7 @@ async def async_get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
     loop = asyncio.get_running_loop()
     ctx = __import__("contextvars").copy_context()
     func = partial(get_market_snapshot, symbol)
-    return await loop.run_in_executor(_get_executor(), ctx.run, func)
+    return await loop.run_in_executor(_get_threadpool(), ctx.run, func)
 
 # --------------------------
 # Health check

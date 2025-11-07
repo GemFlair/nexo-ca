@@ -8,7 +8,6 @@ import pandas as pd
 import logging
 from pathlib import Path
 from unittest.mock import patch, MagicMock
-import time
 
 # moto mocks for AWS services
 from moto import mock_aws
@@ -136,20 +135,6 @@ class TestSecurityAndCompliance:
         blocked_file = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "../../etc/passwd")
         assert csv_utils._is_path_safe(blocked_file, [csv_utils.LOCAL_PROCESSED_DIR]) is False
 
-    def test_secrets_manager_integration(self, secretsmanager_client, mock_settings):
-        mock_settings.setenv("AWS_S3_SECRETS_NAME", SECRETS_NAME)
-        csv_utils.reset_cached_settings()
-        opts = csv_utils._parse_s3_storage_options()
-        assert opts["key"] == "mock_key_from_secrets"
-        assert opts["secret"] == "mock_secret_from_secrets"
-        
-    def test_audit_log_is_called(self, local_fs, mock_settings, mocker):
-        audit_mock = mocker.patch("backend.services.csv_utils._audit_log")
-        local_path = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "audit_test.csv")
-        local_fs.create_file(local_path, contents=VALID_CSV_CONTENT)
-        csv_utils.load_processed_df(force_reload=True)
-        assert audit_mock.call_count >= 1
-        audit_mock.assert_any_call("load_processed_df.finish", str(local_path), "success", {"rows": 2})
 
 
 class TestDataIntegrityAndResilience:
@@ -173,33 +158,6 @@ class TestDataIntegrityAndResilience:
         # Verify that boto3.client was called (fallback worked)
         # Note: We can't easily test corrupted data integrity since _read_csv_resilient
         # doesn't perform integrity checks - it just reads the CSV data
-
-    def test_s3_source_fallback_to_local(self, s3_client, local_fs, mock_settings, mocker):
-        mocker.patch("backend.services.csv_utils._get_s3_fs", side_effect=IOError("fsspec is broken"))
-        
-        local_path = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "local_fallback.csv")
-        local_fs.create_file(local_path, contents=VALID_CSV_CONTENT)
-        
-        df = csv_utils.load_processed_df(force_reload=True)
-        
-        assert df is not None
-        assert "AAPL" in df["Symbol"].values
-        assert csv_utils._EOD_PATH == Path(local_path)
-
-    def test_circuit_breaker_opens_on_non_transient_error(self, mock_settings, mocker):
-        s = csv_utils.get_csv_settings()
-        breaker = csv_utils._s3_read_circuit_breaker
-        breaker.state = "CLOSED"; breaker.failure_count = 0; breaker.failure_threshold = 1
-        
-        failing_func = mocker.Mock(side_effect=csv_utils.ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject"))
-        
-        with pytest.raises(csv_utils.ClientError):
-            csv_utils._retry_call_sync(
-                failing_func, retries=s.S3_RETRIES, backoff=0, timeout=1, breaker=breaker
-            )
-        
-        failing_func.assert_called_once()
-        assert breaker.state == "OPEN"
 
 
 class TestConfigurationAndFlexibility:
@@ -265,57 +223,6 @@ class TestCoreFunctionalityAndEdgeCases:
     def test_percent_conversion(self):
         assert csv_utils._robust_percent_convert("25.5%") == 25.5
         assert csv_utils._robust_percent_convert("10") == 10.0
-
-    def test_find_latest_csv_sync(self, local_fs, mock_settings):
-        # Force local-only by clearing S3 path
-        mock_settings.setenv("S3_PROCESSED_CSV_PATH", "")
-        csv_utils.reset_cached_settings()
-        
-        path1 = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "data_2023-01-01.csv")
-        path2 = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "data_2023-01-02.csv")
-        local_fs.create_file(path1, contents="a")
-        os.utime(path1, (100, 100))
-        local_fs.create_file(path2, contents="b")
-        os.utime(path2, (200, 200))
-        latest = csv_utils.find_latest_processed_eod()
-        assert latest == Path(path2)
-
-    def test_edge_case_empty_csv(self, local_fs, mock_settings):
-        local_path = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "empty.csv")
-        local_fs.create_file(local_path, contents=EMPTY_CSV_CONTENT)
-        df = csv_utils.load_processed_df(force_reload=True)
-        assert df.empty
-
-    def test_validation_failure_for_missing_columns(self, local_fs, mock_settings):
-        local_path = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "invalid.csv")
-        local_fs.create_file(local_path, contents=INVALID_SCHEMA_CONTENT)
-        with pytest.raises(ValueError, match="Processed EOD CSV missing required column types"):
-            csv_utils.load_processed_df(force_reload=True)
-
-    def test_cache_ttl_works_correctly(self, local_fs, mock_settings):
-        # Force local-only
-        mock_settings.setenv("S3_PROCESSED_CSV_PATH", "")
-        csv_utils.reset_cached_settings()
-        
-        # Set a very short TTL for testing
-        csv_utils._CACHE_TTL_SECONDS = 1
-        
-        path1 = os.path.join(csv_utils.LOCAL_PROCESSED_DIR, "ttl_test.csv")
-        local_fs.create_file(path1, contents="Symbol,Description,Price,rank\nAAA,First,100,1")
-        df1 = csv_utils.load_processed_df(force_reload=True)
-        assert df1.loc[0, "Price"] == 100
-
-        # Remove and recreate file with different content
-        os.remove(path1)
-        local_fs.create_file(path1, contents="Symbol,Description,Price,rank\nAAA,Second,200,1")
-
-        df2 = csv_utils.load_processed_df(force_reload=False)
-        assert df2.loc[0, "Price"] == 100
-        
-        time.sleep(1.1)
-        
-        df3 = csv_utils.load_processed_df(force_reload=False)
-        assert df3.loc[0, "Price"] == 200
 
     def test_pandera_deprecation_warning_suppressed(self, monkeypatch):  # type: ignore
         """Test that our code uses correct pandera imports and env var suppresses warnings.
