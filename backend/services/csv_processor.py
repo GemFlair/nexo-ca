@@ -874,6 +874,8 @@ def process_csv_sync(input_path: str, verbose: bool = False, output_path: Option
             except Exception as e:
                 # Capture the textual error immediately and normalize it so we never return None/empty.
                 str_err = str(e) if str(e) else repr(e)
+                if not str_err:
+                    str_err = "Unknown S3 write error"
                 try:
                     logger.exception("S3 write failed; falling back to local: %s", str_err)
                 except Exception:
@@ -899,7 +901,7 @@ def process_csv_sync(input_path: str, verbose: bool = False, output_path: Option
                     pass
 
                 # Build and return the ProcessResult explicitly using the captured error string
-                return cast(ProcessResult, {
+                result = cast(ProcessResult, {
                     "path": fallback_path,
                     "s3": False,
                     "rows": len(sanitized_out),
@@ -907,6 +909,11 @@ def process_csv_sync(input_path: str, verbose: bool = False, output_path: Option
                     "s3_etag": None,
                     "error": str_err
                 })
+                try:
+                    logger.debug("Returning fallback result with error: %s", str_err)
+                except Exception:
+                    pass
+                return result
         else:
             _atomic_local_write_csv(out_path, sanitized_out)
             output_hash = _calculate_sha256_hash(out_path)
