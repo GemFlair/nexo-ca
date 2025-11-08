@@ -465,10 +465,11 @@ def get_breaker_state(name: str) -> Optional[Dict[str, Any]]:
 
 
 def reset_all_circuit_breakers(async_flush: bool = False) -> None:
-    """Reset all circuit breakers but preserve their names in the registry (used in tests)."""
+    """Reset all circuit breakers and clear the registry (used in tests for clean state)."""
     with _BREAKERS_LOCK:
         for cb in _BREAKERS.values():
-            cb.reset()
+            cb.force_close()
+        _BREAKERS.clear()
     if async_flush:
         flush_metrics(force=True)
 
