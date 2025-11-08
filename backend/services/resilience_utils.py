@@ -119,7 +119,7 @@ async def _metrics_flusher() -> None:
             else:
                 # Fallback to log
                 for item in items:
-                    _safe_log(logging.INFO, "async_metric_%s (fallback): %s -> %s", item["type"], item["name"], item["value"])
+                    _safe_log(logging.INFO, "metric_%s (fallback): %s -> %s", item["type"], item["name"], item["value"])
 
         except asyncio.CancelledError:
             break
@@ -159,6 +159,10 @@ def _metric_inc(name: str, value: int = 1) -> None:
                 except Exception as e:
                     _safe_log(logging.WARNING, "metric_inc call to observability_utils failed: %s", e)
         # Use INFO so caplog captures reliably in tests
+        _safe_log(logging.INFO, "metric_inc (fallback): %s -> %s", name, value)
+    
+    # Always log immediately for test observability, even when queuing succeeds
+    if not _OBSERVABILITY_AVAILABLE:
         _safe_log(logging.INFO, "metric_inc (fallback): %s -> %s", name, value)
 
 
