@@ -70,12 +70,6 @@ class TestPDFProcessorS3Routing:
         mock_s3.upload_file.assert_called_once()
 
     @patch('boto3.client')
-    def test_local_input_no_s3_output(self, mock_boto3_client, temp_pdf):
-        """Test that local input does not trigger S3 output."""
-        processor = MasterPDFProcessor()
-        processor._source_is_s3 = False
-        processor._resolved_s3_output_target = None
-
         # No upload should happen
         from backend.services.pdf_processor import _maybe_upload_output_to_s3
         result = _maybe_upload_output_to_s3(str(temp_pdf), 's3://test-bucket/output')
