@@ -131,9 +131,9 @@ def _derive_worker_count_from_settings(settings_obj) -> int:
     if settings_obj is None:
         return 2
     try:
-        if hasattr(settings_obj, "dict"):
+        if hasattr(settings_obj, "model_dump"):
             # pydantic v1/v2 compatibility: dict() or model_dump exists; dict() may be deprecated but still available
-            d = settings_obj.dict()
+            d = settings_obj.model_dump()
             for key in ("EXECUTOR_MAX_WORKERS", "executor_max_workers", "max_workers", "EXECUTOR_WORKERS", "WORKERS"):
                 if key in d:
                     try:
@@ -257,3 +257,20 @@ def pytest_sessionfinish(session, exitstatus):
         shutil.which = _real_which
     except Exception:
         pass
+
+    # Clean up resilience_utils background task to prevent "coroutine never awaited" warnings
+    try:
+        from backend.services import resilience_utils
+        if hasattr(resilience_utils, '_METRICS_TASK') and resilience_utils._METRICS_TASK is not None:
+            if not resilience_utils._METRICS_TASK.done():
+                resilience_utils._METRICS_TASK.cancel()
+                # Give it a moment to cancel gracefully
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if not loop.is_closed():
+                        loop.run_until_complete(asyncio.wait_for(resilience_utils._METRICS_TASK, timeout=1.0))
+                except Exception:
+                    pass  # Ignore cleanup errors
+    except Exception:
+        pass  # Ignore import/cleanup errors
