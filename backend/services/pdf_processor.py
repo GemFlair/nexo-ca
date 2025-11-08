@@ -920,7 +920,12 @@ def _maybe_upload_output_to_s3(local_path: str, dest_s3_url: str) -> Optional[st
     Upload a local file to S3 and return the full s3:// URL on success.
     Automatically appends the file's basename to the destination prefix.
     Detects content type based on extension (JSON → application/json, PDF → application/pdf).
+    Returns None if dest_s3_url is not an S3 URL.
     """
+
+    # Check if destination is actually an S3 URL
+    if not dest_s3_url.startswith('s3://'):
+        return None
 
     try:
         from urllib.parse import urlparse

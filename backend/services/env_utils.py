@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Union
 from dotenv import load_dotenv
 
 # ===========================================================
@@ -69,7 +70,7 @@ def get_bucket_prefix() -> str:
     """Return full S3 prefix for the active environment."""
     return f"{BUCKET_NAME}/{S3_BASE_PREFIX}"
 
-def get(key: str, default=None) -> str | None:
+def get(key: str, default=None) -> Union[str, None]:
     """Get an environment variable value."""
     return os.getenv(key, default)
 

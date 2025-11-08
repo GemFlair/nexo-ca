@@ -158,7 +158,7 @@ class SentimentSettings(BaseModel):
     NEGATION_WINDOW: int = Field(3, ge=1, le=10)  # words before keyword that negate it
     KEYWORDS_DIR: Optional[str] = None  # optional directory to load JSON keyword lists
 
-    @root_validator(pre=True)
+    @model_validator(mode='before')
     def normalize_weights(cls, values):
         """Ensure LLM_WEIGHT + KEYWORD_WEIGHT == 1.0 (normalize proportionally)."""
         lw = float(values.get("LLM_WEIGHT", 0.4))
