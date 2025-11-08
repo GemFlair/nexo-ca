@@ -1298,6 +1298,20 @@ class MasterPDFProcessor:
                     result.s3_output_pdf = s3_pdf_path
                     events.append({"event": "s3_pdf_upload", "target": s3_pdf_path})
                     LOGGER.info(f"✅ Uploaded PDF to {s3_pdf_path}")
+                    
+                    # --- Delete original S3 input file after successful upload ---
+                    try:
+                        import boto3
+                        s3_client = boto3.client("s3")
+                        parsed = str(pdf_path).removeprefix("s3://")
+                        bucket, key = parsed.split("/", 1)
+                        s3_client.delete_object(Bucket=bucket, Key=key)
+                        LOGGER.info(f"🧹 Deleted source file from S3: {pdf_path}")
+                        events.append({"event": "s3_input_deleted", "path": str(pdf_path)})
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to delete original S3 file {pdf_path}: {e}")
+                        events.append({"event": "s3_input_delete_failed", "error": str(e)})
+                        
                 except Exception as e:
                     LOGGER.error(f"Failed to upload PDF to S3: {e}")
                     events.append({"event": "s3_pdf_upload_failed", "error": str(e)})
@@ -1517,39 +1531,55 @@ Command-line interface parity. Flags:
 """
 def _cli():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["batch", "single"], default="single")
-    parser.add_argument("--file", "-f")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--upload", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--force-local", action="store_true")
-    parser.add_argument("--force-s3", action="store_true")
+    parser = argparse.ArgumentParser(description="Process PDF files with AI enrichment")
+    parser.add_argument("--mode", choices=["batch", "single"], help="Processing mode (default: auto-detect)")
+    parser.add_argument("--file", "-f", help="Path to single PDF file")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without processing")
+    parser.add_argument("--upload", action="store_true", help="Upload results to S3")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument("--force-local", action="store_true", help="Force local processing only")
+    parser.add_argument("--force-s3", action="store_true", help="Force S3 processing only")
     args = parser.parse_args()
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    if args.mode == "batch":
+
+    # Auto-detect mode: if --file provided, use single mode; otherwise use batch mode
+    if args.file:
+        mode = "single"
+    elif args.mode:
+        mode = args.mode
+    else:
+        mode = "batch"  # Default to batch mode when no arguments provided
+
+    if mode == "batch":
         if args.file:
             print("Error: --file not allowed in batch mode")
             return
         if args.dry_run:
             print("Dry run: would process all PDFs in batch mode")
             return
+        print("Starting batch processing of all PDFs...")
         success, failure = asyncio.run(process_all_batch(overwrite=args.overwrite, verbose=args.verbose))
         print(f"Batch completed: success={success}, failure={failure}")
-    else:
+    else:  # single mode
         if not args.file:
             print("Error: --file required for single mode")
             return
-        proc = MasterPDFProcessor()
         if args.dry_run:
             print(f"Dry run: would process {args.file}")
-            proc.close()
             return
-        res = proc.process_pdf_sync(args.file, upload_to_s3=args.upload)
-        print("Processed:", res.id if res else "FAILED")
-        proc.close()
+        print(f"Processing single file: {args.file}")
+        proc = MasterPDFProcessor()
+        try:
+            res = proc.process_pdf_sync(args.file, upload_to_s3=args.upload)
+            if res:
+                print(f"✅ Successfully processed: {res.id}")
+            else:
+                print("❌ Processing failed")
+        finally:
+            proc.close()
 
 # --------------------
 # SECTION 20: Module alias for tests

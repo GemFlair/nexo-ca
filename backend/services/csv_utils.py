@@ -795,7 +795,7 @@ def load_indices_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
         return _INDICES_DF
 
     settings = get_csv_settings()
-    static_dir = settings.S3_STATIC_CSV_PATH or str(LOCAL_STATIC_DIR)
+    static_dir = S3_STATIC_CSV_PATH or str(LOCAL_STATIC_DIR)
     path_to_load: Optional[Union[str, Path]] = None
 
     if isinstance(static_dir, str) and _is_s3_uri(static_dir):
