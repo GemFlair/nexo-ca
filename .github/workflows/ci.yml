@@ -2,7 +2,9 @@ name: Run Tests
 
 on:
   push:
+    branches: [ main, develop, dev-playground ]
   pull_request:
+    branches: [ main, develop, dev-playground ]
 
 jobs:
   test:
@@ -30,7 +32,15 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov flake8 mypy
 
-      - name: Run pytest
+      - name: Lint with flake8
+        run: |
+          flake8 backend --max-line-length=120 --ignore=E203,W503
+
+      - name: Type-check with mypy
+        run: |
+          mypy backend
+
+      - name: Run pytest (quick check)
         run: pytest -q --maxfail=1 --disable-warnings
 
       - name: Run pytest with coverage
