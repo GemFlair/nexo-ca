@@ -88,33 +88,39 @@ def _safe_load_json(p: Path) -> Optional[dict]:
         return None
 
 def _normalize_logo_path(logo: Optional[str]) -> Optional[str]:
-    if not isinstance(logo, str):
+    from pathlib import Path
+    from backend.services import env_utils
+
+    if not isinstance(logo, str) or not logo.strip():
         return None
     logo = logo.strip()
-    if not logo:
-        return None
-    # Accept and pass through http(s) or /static URLs unchanged
+
+    # Already an HTTP(S) or /static URL
     if logo.startswith(("http://", "https://")) or logo.startswith("/static"):
         return logo
-    # convert absolute input_data path -> /static/... so frontend can fetch
+
+    # Use env_utils to detect CDN/S3 or local base
     try:
-        logo_path = Path(logo)
-        if logo_path.is_absolute():
-            try:
-                rel_path = logo_path.resolve().relative_to(INPUT_ROOT)
-            except ValueError:
-                try:
-                    rel_path = logo_path.relative_to(INPUT_ROOT)
-                except ValueError:
-                    return None
-            return "/static/" + rel_path.as_posix()
+        base_url = env_utils.get_static_base_url()
+        if base_url:
+            clean_logo = logo.replace("backend/", "").lstrip("/")
+            return f"{base_url.rstrip('/')}/{clean_logo}"
     except Exception:
         pass
-    # If absolute FS path but not under input_data, return None to avoid exposure
-    if logo.startswith("/"):
+
+    # Fallback: local development FastAPI static mount
+    try:
+        abs_logo = Path(logo).resolve()
+        input_root = Path(env_utils.build_local_path("backend/input_data")).resolve()
+        output_root = Path(env_utils.build_local_path("backend/output_data")).resolve()
+        for root in (input_root, output_root):
+            if abs_logo.is_relative_to(root):
+                rel = abs_logo.relative_to(root)
+                return f"/static/{rel.as_posix()}"
+    except Exception:
         return None
-    # already relative/static or other
-    return logo
+
+    return None
 
 def _parse_dt(x: Any) -> float:
     if not x:
@@ -343,6 +349,12 @@ def get_announcement(announcement_id: str):
             _metric_inc("announcements.detail.requests", 1)
             _metric_inc("announcements.detail.hit", 1)
             
+            # frontend alias for React Native
+            if j.get("market_snapshot") and "marketSnapshot" not in j:
+                j["marketSnapshot"] = j["market_snapshot"]
+            if j.get("summary_60") and "summary" not in j:
+                j["summary"] = j["summary_60"]
+            
             return AnnouncementDetail(**j)
 
     # direct file fallback with recursive search
@@ -403,6 +415,12 @@ def get_announcement(announcement_id: str):
         # Record observability metrics for successful retrieval via fallback
         _metric_inc("announcements.detail.requests", 1)
         _metric_inc("announcements.detail.hit", 1)
+        
+        # frontend alias for React Native
+        if j.get("market_snapshot") and "marketSnapshot" not in j:
+            j["marketSnapshot"] = j["market_snapshot"]
+        if j.get("summary_60") and "summary" not in j:
+            j["summary"] = j["summary_60"]
         
         return AnnouncementDetail(**j)
 

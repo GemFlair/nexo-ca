@@ -103,6 +103,41 @@ except Exception:
 # -------------------------
 from backend.services import env_utils
 
+# ============================================================
+# 🌍 Environment-Aware Base Paths
+# ============================================================
+ENV = env_utils.get_environment()
+if ENV == "local_dev":
+    BASE_IMAGE_PATH = env_utils.build_local_path("backend/output_data/processed_images")
+    BASE_URL = "http://127.0.0.1:8000"
+else:
+    BASE_IMAGE_PATH = env_utils.get_processed_images_dir().rstrip("/")
+    BASE_URL = (
+        env_utils.get_static_base_url()
+        or os.getenv("CDN_BASE_URL")
+        or f"https://{env_utils.BUCKET_NAME}.s3.amazonaws.com/{env_utils.S3_BASE_PREFIX}"
+    )
+
+
+def get_logo_path(symbol: str, company_name: str):
+    """Return deterministic logo path (URL + local/S3)."""
+    sym = (symbol or "").upper()
+    local_path = f"{BASE_IMAGE_PATH}/processed_logos/{sym}_logo.png"
+    public_url = f"{BASE_URL}/output_data/processed_images/processed_logos/{sym}_logo.png"
+    return local_path, public_url
+
+
+def get_banner_path(symbol: str, company_name: str):
+    """Return deterministic banner path (URL + local/S3)."""
+    sym = (symbol or "").upper()
+    local_path = f"{BASE_IMAGE_PATH}/processed_banners/{sym}_banner.webp"
+    public_url = f"{BASE_URL}/output_data/processed_images/processed_banners/{sym}_banner.webp"
+    return local_path, public_url
+
+
+_deterministic_logo_path = get_logo_path
+_deterministic_banner_path = get_banner_path
+
 # -------------------------
 # Logging (module-level only)
 # -------------------------
@@ -116,33 +151,25 @@ if not logger.handlers:
 # -------------------------
 # Configuration & Constants
 # -------------------------
-# Local processed images directories (must match image_processor outputs)
-PROCESSED_LOGOS = Path(env_utils.build_local_path(
-    env_utils.get("LOCAL_PROCESSED_IMAGE_DIR", "output_data/processed_images")
-)) / "processed_logos"
-PROCESSED_BANNERS = Path(env_utils.build_local_path(
-    env_utils.get("LOCAL_PROCESSED_IMAGE_DIR", "output_data/processed_images")
-)) / "processed_banners"
+LOCAL_IMAGE_ROOT = Path(env_utils.build_local_path("backend/output_data/processed_images"))
+PROCESSED_LOGOS = LOCAL_IMAGE_ROOT / "processed_logos"
+PROCESSED_BANNERS = LOCAL_IMAGE_ROOT / "processed_banners"
 
-# Local URL base used by frontend static server
-URL_BASE = os.getenv("IMAGE_URL_BASE", "/static/images")
+if ENV == "local_dev":
+    _url_base = "backend/output_data/processed_images"
+else:
+    _url_base = str(BASE_IMAGE_PATH).rstrip("/")
+URL_BASE = _url_base
 PLACEHOLDER_LOGO = os.getenv("PLACEHOLDER_LOGO", "default_logo.png")
 PLACEHOLDER_BANNER = os.getenv("PLACEHOLDER_BANNER", "default_banner.webp")
 
-# Default S3 prefix for processed images (aligns with env_utils environment handling)
-# Use lazy evaluation to avoid RuntimeError in local_dev environment
-try:
-    _DEFAULT_S3_PROCESSED = env_utils.build_s3_path(
-        env_utils.get("S3_PROCESSED_IMAGE_DIR", "output_data/processed_images")
-    )
-except RuntimeError:
-    # In local_dev mode, S3 paths raise RuntimeError - use empty string as fallback
-    _DEFAULT_S3_PROCESSED = ""
+if str(BASE_IMAGE_PATH).startswith("s3://"):
+    _s3_processed_path = str(BASE_IMAGE_PATH).rstrip("/")
+else:
+    _s3_processed_path = os.getenv("S3_PROCESSED_IMAGES_PATH", "").strip()
+S3_PROCESSED_IMAGES_PATH = _s3_processed_path
 
-# S3 prefix for processed images (optional)
-S3_PROCESSED_IMAGES_PATH = (os.getenv("S3_PROCESSED_IMAGES_PATH") or _DEFAULT_S3_PROCESSED).strip()
-# Optional CDN base URL for S3 assets
-CDN_BASE_URL = (os.getenv("CDN_BASE_URL") or "").strip()
+CDN_BASE_URL = (os.getenv("CDN_BASE_URL") or (BASE_URL if str(BASE_URL).startswith("http") else "")).strip()
 
 # Cache & thread-pool tuning (env-driven)
 IMAGE_CACHE_TTL_SECONDS = int(os.getenv("IMAGE_CACHE_TTL_SECONDS", "3600"))
@@ -479,7 +506,15 @@ def _url_for_candidate_remote(key_only: str, s3_uri: str) -> str:
     """
     if CDN_BASE_URL:
         encoded = _encode_key_for_cdn(key_only)
-        return f"{CDN_BASE_URL.rstrip('/')}/{encoded.lstrip('/')}"
+        env_prefix = ""
+        try:
+            raw_env = env_utils.get("ENVIRONMENT", None)
+            env = raw_env.strip() if isinstance(raw_env, str) else ""
+            if env and env not in encoded:
+                env_prefix = f"{env}/"
+        except Exception:
+            pass
+        return f"{CDN_BASE_URL.rstrip('/')}/{env_prefix}{encoded.lstrip('/')}"
     return s3_uri
 
 
@@ -606,9 +641,17 @@ def _url_for_candidate(candidate: Optional[ImageCandidate], url_subpath: str) ->
 # -------------------------
 def get_logo_path(symbol: str, company_name: str) -> Tuple[ImageCandidate, str]:
     """Return (ImageCandidate, public_url) for a logo (sync)."""
+    deterministic_local, deterministic_url = _deterministic_logo_path(symbol, company_name)
     candidates = candidate_logo_filenames(symbol, company_name)
     res = find_first_existing(PROCESSED_LOGOS, candidates)
     url = _url_for_candidate(res, "processed_logos")
+    if res.filename == PLACEHOLDER_LOGO and deterministic_url:
+        filename = Path(deterministic_local).name if deterministic_local else res.filename
+        if str(deterministic_local).startswith("s3://"):
+            candidate = ImageCandidate(filename=filename, s3_uri=str(deterministic_local), local_path=None, public_url=deterministic_url)
+        else:
+            candidate = ImageCandidate(filename=filename, s3_uri=None, local_path=str(deterministic_local), public_url=deterministic_url)
+        return candidate, deterministic_url
     return res, url
 
 
@@ -622,9 +665,17 @@ async def async_get_logo_path(symbol: str, company_name: str) -> Tuple[ImageCand
 
 def get_banner_path(symbol: str, company_name: str) -> Tuple[ImageCandidate, str]:
     """Return (ImageCandidate, public_url) for a banner (sync)."""
+    deterministic_local, deterministic_url = _deterministic_banner_path(symbol, company_name)
     candidates = candidate_banner_filenames(symbol, company_name)
     res = find_first_existing(PROCESSED_BANNERS, candidates)
     url = _url_for_candidate(res, "processed_banners")
+    if res.filename == PLACEHOLDER_BANNER and deterministic_url:
+        filename = Path(deterministic_local).name if deterministic_local else res.filename
+        if str(deterministic_local).startswith("s3://"):
+            candidate = ImageCandidate(filename=filename, s3_uri=str(deterministic_local), local_path=None, public_url=deterministic_url)
+        else:
+            candidate = ImageCandidate(filename=filename, s3_uri=None, local_path=str(deterministic_local), public_url=deterministic_url)
+        return candidate, deterministic_url
     return res, url
 
 

@@ -1191,17 +1191,48 @@ class MasterPDFProcessor:
                 except Exception:
                     LOGGER.debug("image_utils.get_brand_assets failed", exc_info=True)
 
-            # Deterministic fallback paths
-            if sym_slug and not company_logo_url:
-                company_logo_url = f"backend/output_data/processed_images/processed_logos/{sym_slug}_logo.png"
-            if sym_slug and not banner_image_url:
-                banner_image_url = f"backend/output_data/processed_images/processed_banners/{sym_slug}_banner.webp"
+            def _processed_images_base() -> str:
+                try:
+                    return env_utils.get_processed_images_dir().rstrip("/")
+                except Exception:
+                    return "backend/output_data/processed_images".rstrip("/")
 
-            # Absolute defaults (only if symbol unknown)
-            if not company_logo_url:
-                company_logo_url = "backend/output_data/processed_images/processed_logos/Default_logo.png"
-            if not banner_image_url:
-                banner_image_url = "backend/output_data/processed_images/processed_banners/Default_banner.webp"
+            if sym_slug and (not company_logo_url or not banner_image_url):
+                # Environment-aware image path generation
+                resolved_logo = None
+                resolved_banner = None
+                try:
+                    _, resolved_logo = image_utils.get_logo_path(symbol or "", company_name or "")
+                    _, resolved_banner = image_utils.get_banner_path(symbol or "", company_name or "")
+                except Exception:
+                    resolved_logo = None
+                    resolved_banner = None
+                base_path = _processed_images_base()
+                if not company_logo_url:
+                    company_logo_url = resolved_logo or f"{base_path}/processed_logos/{sym_slug}_logo.png"
+                if not banner_image_url:
+                    banner_image_url = resolved_banner or f"{base_path}/processed_banners/{sym_slug}_banner.webp"
+
+            base_url = env_utils.get_public_media_base().rstrip("/")
+            symbol_for_media = sym_slug or _symbol_slug(company_name) or "DEFAULT"
+
+            def _finalize_media_url(candidate: Optional[str], default_tail: str) -> str:
+                if candidate:
+                    lower_candidate = candidate.lower()
+                    if lower_candidate.startswith(("http://", "https://", "s3://")):
+                        return candidate
+                    normalized = candidate.lstrip("/")
+                    return f"{base_url}/{normalized}"
+                return f"{base_url}/{default_tail.lstrip('/')}"
+
+            company_logo_url = _finalize_media_url(
+                company_logo_url,
+                f"output_data/processed_images/processed_logos/{symbol_for_media}_logo.png",
+            )
+            banner_image_url = _finalize_media_url(
+                banner_image_url,
+                f"output_data/processed_images/processed_banners/{symbol_for_media}_banner.webp",
+            )
 
             # Use PDF's original datetime for deterministic ID (not processing time)
             # This prevents duplicate JSONs when re-processing the same PDF
@@ -1263,7 +1294,7 @@ class MasterPDFProcessor:
                 _atomic_write_json(temp_json, result.to_dict())
                 
                 try:
-                    aws_utils.upload_file_to_s3(temp_json, s3_json_path, overwrite=True)
+                    aws_utils.upload_file_to_s3(temp_json, s3_json_path, env_utils.get("S3_STORAGE_OPTIONS"), overwrite=True)
                     result.s3_output_json = s3_json_path
                     events.append({"event": "s3_json_upload", "target": s3_json_path})
                     LOGGER.info(f"✅ Uploaded JSON to {s3_json_path}")
@@ -1294,7 +1325,7 @@ class MasterPDFProcessor:
                 
                 try:
                     # Upload the temp processing file to S3 processed location
-                    aws_utils.upload_file_to_s3(p, s3_pdf_path, overwrite=True)
+                    aws_utils.upload_file_to_s3(p, s3_pdf_path, env_utils.get("S3_STORAGE_OPTIONS"), overwrite=True)
                     result.s3_output_pdf = s3_pdf_path
                     events.append({"event": "s3_pdf_upload", "target": s3_pdf_path})
                     LOGGER.info(f"✅ Uploaded PDF to {s3_pdf_path}")

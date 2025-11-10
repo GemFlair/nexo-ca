@@ -19,7 +19,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 from contextvars import ContextVar
 from pydantic import field_validator
 
@@ -399,12 +399,26 @@ if static_dir.exists() and static_dir.is_dir():
 else:
     logger.debug("Static dir %s not found; skipping mount", static_dir)
 
+# ✅ Serve processed images dynamically (logos, banners) — keep /backend in path
+processed_images_dir = Path(env_utils.build_local_path("backend/output_data/processed_images"))
+if processed_images_dir.exists() and processed_images_dir.is_dir():
+    app.mount(
+        "/backend/output_data/processed_images",
+        StaticFiles(directory=str(processed_images_dir)),
+        name="processed_images_backend",
+    )
+    logger.info("Mounted /backend/output_data/processed_images -> %s", processed_images_dir)
+else:
+    logger.warning("Processed images dir not found: %s", processed_images_dir)
+
 # ---------- Expose settings on app.state ----------
 app.state.settings = settings
 
 # ---------- Metrics endpoint ----------
 if make_asgi_app is not None:
-    metrics_app = make_asgi_app()
+    from starlette.types import ASGIApp
+
+    metrics_app = cast(ASGIApp, make_asgi_app())
     app.mount("/metrics", metrics_app)
 else:
     logger.debug("/metrics not mounted (prometheus_client missing)")
